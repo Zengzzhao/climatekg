@@ -18,6 +18,7 @@ from prompts_zh import (
 )
 from scientometrics_ontology import annotate_scientometrics
 from evidence_validation_agent import partial_ratio_score, DEFAULT_THRESHOLD
+from local_formula_evidence import complete_local_formula_evidence
 from validation_agent import validate_data
 from evaluation_agent import evaluate_data
 from triplet_metrics import table3, markdown_table, write_report
@@ -79,6 +80,7 @@ def request_stage(client, model, text, max_tokens, thinking, stage, schema, inst
                          + json.dumps(context, ensure_ascii=False) + "\n\n")
     response = client.chat.completions.create(
         model=model,
+        temperature=0,
         response_format={"type": "json_object"},
         max_tokens=max_tokens,
         extra_body={"thinking": {"type": thinking}},
@@ -99,7 +101,8 @@ def request_stage(client, model, text, max_tokens, thinking, stage, schema, inst
     return schema.model_validate_json(choice.message.content or "").model_dump()
 
 
-def extract(client, model: str, text: str, max_tokens: int, thinking: str = "disabled") -> dict:
+def extract(client, model: str, text: str, max_tokens: int, thinking: str = "disabled",
+            complete_formulas: bool = True) -> dict:
     """顺序抽取论文信息、指标细节、实体和关系证据，不进行筛选。"""
     def call(stage, schema, instructions, context=None):
         return request_stage(client, model, text, max_tokens, thinking,
@@ -123,6 +126,9 @@ def extract(client, model: str, text: str, max_tokens: int, thinking: str = "dis
     result = Extraction.model_validate({**metadata, **entities, **relations, **details}).model_dump()
     # Cross-stage endpoint checks belong to the subsequent conformance stage.
     result["paper_entity"] = paper_entity
+    if complete_formulas:
+        count = complete_local_formula_evidence(result, text)
+        print(f"局部公式证据补全：{count} 条（仅紧邻原文）", flush=True)
     return result
 
 
@@ -166,6 +172,8 @@ def main():
     parser.add_argument("--thinking", choices=("disabled", "enabled"), default="disabled",
                         help="DeepSeek thinking mode; disabled keeps the budget for extraction output")
     parser.add_argument("--threshold", type=float, default=DEFAULT_THRESHOLD)
+    parser.add_argument("--no-local-formula-completion", action="store_true",
+                        help="Disable adjacent formula completion to reproduce the original baseline")
     parser.add_argument("--force", action="store_true")
     args = parser.parse_args()
     if not 0 <= args.threshold <= 100 or args.max_tokens <= 0:
@@ -192,7 +200,8 @@ def main():
     if not api_key:
         parser.error("Set DEEPSEEK_API_KEY in extraction/.env")
     with OpenAI(api_key=api_key, base_url=base_url, timeout=180, max_retries=2) as client:
-        data = extract(client, args.model, markdown, args.max_tokens, args.thinking)
+        data = extract(client, args.model, markdown, args.max_tokens, args.thinking,
+                       complete_formulas=not args.no_local_formula_completion)
     write_json(paths[0], data)
     annotate_scientometrics(data)
     write_json(paths[1], data)

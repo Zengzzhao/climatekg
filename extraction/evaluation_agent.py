@@ -19,7 +19,7 @@ from typing import Iterable
 
 from dotenv import load_dotenv
 from prompts_zh import EVALUATION_PROMPT
-from validation_agent import create_client, generate_label, resolve_model
+from validation_agent import create_client, generate_label, resolve_model, parse_label
 from tqdm import tqdm
 
 
@@ -101,7 +101,8 @@ def evaluate_data(data: dict, client, provider: str, model: str) -> tuple[int, i
             raise ValueError("kg_extraction_triplets must contain objects")
 
         validation_result = evaluate_triplet(client, provider, model, triplet)
-        is_valid = validation_result.lower() == "valid"
+        is_valid = parse_label(validation_result)
+        triplet["evaluation_response"] = validation_result
         triplet["eval"] = is_valid
         if is_valid:
             eval_valid_count += 1

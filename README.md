@@ -160,11 +160,55 @@ python extract_md_deepseek.py \
 2. 直接抽取指标定义、公式和局限性；缺失内容返回空列表。
 3. 独立抽取 `Indicator` 实体。
 4. 独立抽取关系三元组和证据段落。
-5. 合并结果，执行科学计量本体检查和 Markdown 证据核验。
+5. 合并结果，补全紧邻的公式证据，执行科学计量本体检查和 Markdown 证据核验。
 6. 逐条调用 DeepSeek Validator，判断证据是否支持关系，添加 valid 标志。
 7. 逐条调用独立 Evaluator，使用科学计量评估提示词重新判断，添加 eval 标志。
 
 科学计量实体类型为 `Paper` 和 `Indicator`，关系包括 `proposes`、`modifies`、`applies`、`variant_of`、`derived_from`、`improves_on`、`alternative_to` 和 `component_of`。证据必须来自输入 Markdown；程序不会下载 Markdown 中的图片链接。
+
+为避免证据停在 “The formula is shown below:” 却遗漏下一行公式，入口默认在抽取后执行
+`local_formula_evidence.py` 的确定性边界补全：仅当证据以“公式如下/公式见下文”等提示结束、
+且能在原文唯一精确定位时，追加紧邻的最多两块显示公式（`$$...$$`、`\[...\]` 或
+math/latex 代码块）和一段以 where/with/in which/式中/其中开头的变量说明。
+新增部分最多 2000 字符、40 个换行；不会跳过正文、标题或图片去寻找公式，也不按公式编号回查。
+补全后的 `paragraph` 仍是连续原文，供证据核验、Validator 和 Evaluator 共同使用；
+原证据保存在 `paragraph_original`，补全规则和字符偏移保存在 `local_formula_completion`。
+该步骤不新增 LLM 请求，不更改关系标签，也不会自动把 valid/eval 设为 true。
+
+这是 baseline 的局部证据完整性修复。添加 `--no-local-formula-completion` 可关闭该步骤，
+复现旧版证据行为；建议新旧结果使用不同 `--output-root` 保存。既有 JSON 与实验报告不会自动改写，
+需重新运行入口后才能得到基于新证据的 valid/eval 与 C_triplet。
+
+当前 baseline 另包含以下提示词与模块修正，阶段顺序和四次抽取请求保持不变：
+
+- 实体与关系仍独立抽取；统一指标命名规则，关系证据要求复制完整的单个自然段及紧邻公式。
+  不按关系类型触发检索，不拼接不同章节，也不把指标细节字段当作额外关系证据。
+- 抽取、Validator、Evaluator 共用明确的关系定义。局部 we/this study 可指当前论文，
+  但不能把被引论文的贡献归为本文；复合指标的组成方向与方法衍生、相关与替代分别区分。
+- 本体模块仅在名称经 Unicode、空白、连字符规范化后唯一匹配时修正排版差异，
+  不用模糊相似度猜别名，不把缺失端点自动加入实体清单。对称关系规范方向；
+  同篇论文提出并实际应用同一指标不再被错误视为互斥，variant_of/derived_from 仍互斥。
+- DeepSeek 请求固定 temperature=0。保留 `validation_response`、`evaluation_response`；
+  非 valid/invalid 的响应会报错，避免将格式错误混算为错误关系。
+
+修改评估提示词后，应使用同一固定 Evaluator 重评新旧候选，再比较各阶段 C_triplet；
+不要将旧裁判的低分直接与新裁判的高分视作抽取改进。小规模多轮实验及原始阶段文件位于
+`reports/baseline_optimization_2026-11-02/`（第一版）与
+`reports/baseline_optimization_v2_2026-11-02/`（当前第二版）。这些是五篇开发集上的结果，
+不代表复现作者在2,000篇气候论文上的指标或人工一致性。
+最终增加了组成关系反向/变体混淆的局部判定检查；固定最终裁判后，对第二版三轮全部候选
+重新执行后续阶段，完整报告与最终代码快照位于
+`reports/baseline_optimization_final_2026-11-02/`。这是固定候选重放，不是又一次整篇抽取，
+也不是根据 eval 挑选关系；旧候选同样用最终裁判重新评估，并保留历史判定供比较。
+
+后续针对前两阶段的优化保持 Validator/Evaluator、关系定义和所有评分代码不变，
+重整了实体命名及单段原文支持的抽取提示词，并为本体名称匹配补充了数学定界符和简单下标括号的
+排版等价规范化（例如 `$x_{d}$-index` 与 `x_d-index`）；下标值不同或匹配歧义仍不接受。
+没有添加关系驱动检索、跨章节证据、候选预筛选或新的模型请求。
+本轮三个配置各跑五篇三轮，最终保留第一版提示词与数学排版修正的组合；
+额外长示例导致下降的第二版已撤回。全部结果、失败配置和固定裁判校验见
+`reports/early_stage_optimization_final_2026-11-02/report.md`，
+生产代码快照见同目录 `frozen_code/`。旧实验结果保留，不自动改写。
 
 脚本默认关闭 DeepSeek 思考模式，把生成额度留给结构化 JSON；可以用 `--thinking enabled` 开启。`--max-tokens` 是每次模型请求的生成上限，默认值为 16384。若模型返回 `length`，程序会拒绝保存不完整结果。
 

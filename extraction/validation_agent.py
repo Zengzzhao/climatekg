@@ -13,6 +13,7 @@ import concurrent.futures
 import datetime as dt
 import json
 import os
+import re
 from functools import partial
 from pathlib import Path
 from typing import Iterable
@@ -99,6 +100,7 @@ def generate_label(client, provider: str, model: str, prompt: str) -> str:
     if provider == "deepseek":
         response = client.chat.completions.create(
             model=model,
+            temperature=0,
             messages=[{"role": "user", "content": prompt}],
             max_tokens=128,
             extra_body={"thinking": {"type": "disabled"}},
@@ -113,6 +115,14 @@ def generate_label(client, provider: str, model: str, prompt: str) -> str:
         contents=prompt,
     )
     return (response.text or "").strip()
+
+
+def parse_label(response: str) -> bool:
+    """Accept a binary label, never silently count malformed API output as false."""
+    label = response.strip().strip('`\"\'').strip().lower()
+    if not re.fullmatch(r"valid|invalid", label):
+        raise ValueError(f"Expected valid/invalid, got {response!r}")
+    return label == "valid"
 
 
 def validate_triplet(client, provider: str, model: str, triplet: dict) -> str:
@@ -147,7 +157,8 @@ def validate_data(data: dict, client, provider: str, model: str) -> tuple[int, i
             raise ValueError("kg_extraction_triplets must contain objects")
 
         validation_result = validate_triplet(client, provider, model, triplet)
-        is_valid = validation_result.lower() == "valid"
+        is_valid = parse_label(validation_result)
+        triplet["validation_response"] = validation_result
         triplet["valid"] = is_valid
         if is_valid:
             valid_count += 1
