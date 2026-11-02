@@ -17,3 +17,7 @@ kg_create/data/
 
 # Built by scripts/build_hf_dataset.py, uploaded to Hugging Face
 hf_release/
+
+.venv/
+
+reports/

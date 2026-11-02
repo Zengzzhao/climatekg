@@ -12,12 +12,14 @@ import argparse
 import concurrent.futures
 import datetime as dt
 import json
+import os
 from functools import partial
 from pathlib import Path
 from typing import Iterable
 
 from dotenv import load_dotenv
-from prompts_deprecated import GPT_VALIDATION_PROMPT
+from prompts_zh import EVALUATION_PROMPT
+from validation_agent import create_client, generate_label, resolve_model
 from tqdm import tqdm
 
 
@@ -66,44 +68,15 @@ def triplet_value(triplet: dict, key: str, fallback_key: str | None = None) -> s
     return "" if value is None else str(value)
 
 
-def resolve_model(model_arg: str) -> tuple[str, str]:
-    if model_arg.lower() == "gpt":
-        return "gpt", DEFAULT_GPT_MODEL
-    return "gemini", model_arg
-
-
-def create_client(provider: str):
-    if provider == "gpt":
-        from openai import OpenAI
-
-        return OpenAI()
-    from google import genai
-
-    return genai.Client()
-
-
-def generate_label(client, provider: str, model: str, prompt: str) -> str:
-    if provider == "gpt":
-        response = client.responses.create(
-            model=model,
-            input=prompt,
-        )
-        return response.output_text.strip()
-
-    response = client.models.generate_content(
-        model=model,
-        contents=prompt,
-    )
-    return (response.text or "").strip()
-
-
 def evaluate_triplet(client, provider: str, model: str, triplet: dict) -> str:
-    prompt = GPT_VALIDATION_PROMPT.format(
+    prompt = EVALUATION_PROMPT.format(
         source=triplet_value(
             triplet,
             "source_entity_instance_anaphora_resolved",
             "source_entity_instance",
         ),
+        source_type=triplet_value(triplet, "source_entity_type"),
+        target_type=triplet_value(triplet, "target_entity_type"),
         relation=triplet_value(triplet, "relation"),
         target=triplet_value(
             triplet,
@@ -116,14 +89,8 @@ def evaluate_triplet(client, provider: str, model: str, triplet: dict) -> str:
     return generate_label(client, provider, model, prompt)
 
 
-def process_file(
-    json_path: Path,
-    output_dir: Path,
-    provider: str,
-    model: str,
-) -> tuple[int, int]:
-    client = create_client(provider)
-    data = json.loads(json_path.read_text(encoding="utf-8"))
+def evaluate_data(data: dict, client, provider: str, model: str) -> tuple[int, int]:
+    """Evaluate all triples independently; retain valid and all prior stage verdicts."""
     triplets = data.get("kg_extraction_triplets", [])
     if not isinstance(triplets, list):
         raise ValueError("kg_extraction_triplets must be a list")
@@ -139,12 +106,25 @@ def process_file(
         if is_valid:
             eval_valid_count += 1
 
+    return len(triplets), eval_valid_count
+
+
+def process_file(
+    json_path: Path,
+    output_dir: Path,
+    provider: str,
+    model: str,
+) -> tuple[int, int]:
+    client = create_client(provider)
+    data = json.loads(json_path.read_text(encoding="utf-8"))
+    triplet_count, eval_valid_count = evaluate_data(data, client, provider, model)
+
     output_path = output_dir / json_path.name
     with output_path.open("w", encoding="utf-8") as f:
         json.dump(data, f, indent=4)
         f.write("\n")
 
-    return len(triplets), eval_valid_count
+    return triplet_count, eval_valid_count
 
 
 def evaluate_papers(
@@ -227,9 +207,9 @@ def parse_args() -> argparse.Namespace:
     )
     parser.add_argument(
         "--model",
-        default=DEFAULT_MODEL,
+        default=os.getenv("DEEPSEEK_MODEL", "deepseek-chat"),
         help=(
-            "Model selector. Defaults to gemini-2.5-flash. "
+            "Model selector. Defaults to DEEPSEEK_MODEL or deepseek-chat. "
             "Pass 'gpt' to use gpt-5-mini-2025-08-07."
         ),
     )

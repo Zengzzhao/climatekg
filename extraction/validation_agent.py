@@ -12,12 +12,13 @@ import argparse
 import concurrent.futures
 import datetime as dt
 import json
+import os
 from functools import partial
 from pathlib import Path
 from typing import Iterable
 
 from dotenv import load_dotenv
-from prompts_deprecated import VALIDATION_PROMPT
+from prompts_zh import VALIDATION_PROMPT
 from tqdm import tqdm
 
 
@@ -69,13 +70,18 @@ def triplet_value(triplet: dict, key: str, fallback_key: str | None = None) -> s
 def resolve_model(model_arg: str) -> tuple[str, str]:
     if model_arg.lower() == "gpt":
         return "gpt", DEFAULT_GPT_MODEL
+    if model_arg.lower().startswith("deepseek"):
+        return "deepseek", model_arg
     return "gemini", model_arg
 
 
 def create_client(provider: str):
-    if provider == "gpt":
+    if provider in ("gpt", "deepseek"):
         from openai import OpenAI
-
+        if provider == "deepseek":
+            return OpenAI(api_key=os.environ["DEEPSEEK_API_KEY"],
+                          base_url=os.getenv("DEEPSEEK_BASE_URL", "https://api.deepseek.com"),
+                          timeout=180, max_retries=2)
         return OpenAI()
     from google import genai
 
@@ -89,6 +95,18 @@ def generate_label(client, provider: str, model: str, prompt: str) -> str:
             input=prompt,
         )
         return response.output_text.strip()
+
+    if provider == "deepseek":
+        response = client.chat.completions.create(
+            model=model,
+            messages=[{"role": "user", "content": prompt}],
+            max_tokens=128,
+            extra_body={"thinking": {"type": "disabled"}},
+        )
+        choice = response.choices[0]
+        if choice.finish_reason != "stop":
+            raise ValueError(f"Validator incomplete: finish_reason={choice.finish_reason}")
+        return (choice.message.content or "").strip()
 
     response = client.models.generate_content(
         model=model,
@@ -118,6 +136,25 @@ def validate_triplet(client, provider: str, model: str, triplet: dict) -> str:
     return generate_label(client, provider, model, prompt)
 
 
+def validate_data(data: dict, client, provider: str, model: str) -> tuple[int, int]:
+    """Validate every triple, retaining prior verdicts as in the original climate pipeline."""
+    triplets = data.get("kg_extraction_triplets", [])
+    if not isinstance(triplets, list):
+        raise ValueError("kg_extraction_triplets must be a list")
+    valid_count = 0
+    for triplet in triplets:
+        if not isinstance(triplet, dict):
+            raise ValueError("kg_extraction_triplets must contain objects")
+
+        validation_result = validate_triplet(client, provider, model, triplet)
+        is_valid = validation_result.lower() == "valid"
+        triplet["valid"] = is_valid
+        if is_valid:
+            valid_count += 1
+
+    return len(triplets), valid_count
+
+
 def process_file(
     json_path: Path,
     output_dir: Path,
@@ -130,23 +167,14 @@ def process_file(
     if not isinstance(triplets, list):
         raise ValueError("kg_extraction_triplets must be a list")
 
-    valid_count = 0
-    for triplet in triplets:
-        if not isinstance(triplet, dict):
-            raise ValueError("kg_extraction_triplets must contain objects")
-
-        validation_result = validate_triplet(client, provider, model, triplet)
-        is_valid = validation_result.lower() == "valid"
-        triplet["valid"] = is_valid
-        if is_valid:
-            valid_count += 1
+    triplet_count, valid_count = validate_data(data, client, provider, model)
 
     output_path = output_dir / json_path.name
     with output_path.open("w", encoding="utf-8") as f:
         json.dump(data, f, indent=4)
         f.write("\n")
 
-    return len(triplets), valid_count
+    return triplet_count, valid_count
 
 
 def validate_papers(
@@ -229,9 +257,9 @@ def parse_args() -> argparse.Namespace:
     )
     parser.add_argument(
         "--model",
-        default=DEFAULT_MODEL,
+        default=os.getenv("DEEPSEEK_MODEL", "deepseek-chat"),
         help=(
-            "Model selector. Defaults to gemini-2.5-flash. "
+            "Model selector. Defaults to DEEPSEEK_MODEL or deepseek-chat. "
             "Pass 'gpt' to use gpt-5-mini-2025-08-07."
         ),
     )

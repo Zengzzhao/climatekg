@@ -258,8 +258,11 @@ def triplet_conforms(triplet: dict, ontology: set[tuple[str, str, str]]) -> bool
 
 
 def annotate_triplet_conformance(
-    data: dict, ontology: set[tuple[str, str, str]]
+    data: dict, ontology: set[tuple[str, str, str]] | None = None
 ) -> tuple[int, int]:
+    if ontology is None:
+        from scientometrics_ontology import annotate_scientometrics
+        return annotate_scientometrics(data)
     triplets = data.get("kg_extraction_triplets", [])
     if not isinstance(triplets, list):
         raise ValueError("kg_extraction_triplets must be a list")
@@ -294,7 +297,6 @@ def add_ontology_conformance(input_dir: Path, output_dir: Path) -> dict[str, int
         raise FileNotFoundError(f"Extraction output directory not found: {input_dir}")
 
     output_dir.mkdir(parents=True, exist_ok=True)
-    ontology = set(FILTERED_RELATIONSHIP_SOURCE_TO_TARGET)
     stats = {
         "processed": 0,
         "triplets": 0,
@@ -309,7 +311,7 @@ def add_ontology_conformance(input_dir: Path, output_dir: Path) -> dict[str, int
                 data = json.load(f)
 
             remove_paper_conformance_flags(data)
-            conformed, not_conformed = annotate_triplet_conformance(data, ontology)
+            conformed, not_conformed = annotate_triplet_conformance(data)
 
             output_path = output_dir / json_path.name
             with output_path.open("w", encoding="utf-8") as f:
