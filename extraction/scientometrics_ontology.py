@@ -1,4 +1,4 @@
-"""Local type, endpoint and exclusivity checks for the scientific-metrics domain."""
+"""Local type and endpoint checks for the scientific-metrics domain."""
 import unicodedata
 import re
 
@@ -48,15 +48,5 @@ def annotate_scientometrics(data):
             if rank[s] > rank[d]:
                 t['source_entity_instance'], t['target_entity_instance'] = d, s
         t['ontology_conformed'] = bool(valid)
-    # Retain competing claims, but flag mutual-exclusion violations instead of inventing a resolution.
-    for t in triplets:
-        peers = {x['relation'] for x in triplets
-                 if x['source_entity_instance'] == t['source_entity_instance']
-                 and x['target_entity_instance'] == t['target_entity_instance']
-                 and x['source_entity_type'] == t['source_entity_type']
-                 and x['target_entity_type'] == t['target_entity_type']}
-        # A paper may both introduce and empirically apply the same indicator.
-        # Evidence support for each claim is decided by the semantic stages.
-        if t['relation'] in {'variant_of', 'derived_from'} and {'variant_of', 'derived_from'} <= peers:
-            t['ontology_conformed'] = False
+    # Every relation is independent: multiple supported labels may coexist.
     return sum(t['ontology_conformed'] for t in triplets), sum(not t['ontology_conformed'] for t in triplets)

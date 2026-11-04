@@ -19,7 +19,8 @@ from pathlib import Path
 from typing import Iterable
 
 from dotenv import load_dotenv
-from prompts_zh import VALIDATION_PROMPT
+from prompts_zh import VALIDATION_PROMPT, MULTI_EVIDENCE_READING
+from evidence_schema import evidence_text
 from tqdm import tqdm
 
 
@@ -126,7 +127,10 @@ def parse_label(response: str) -> bool:
 
 
 def validate_triplet(client, provider: str, model: str, triplet: dict) -> str:
-    prompt = VALIDATION_PROMPT.format(
+    template = VALIDATION_PROMPT
+    if "evidence" in triplet or triplet.get("evidence_units"):
+        template = template.replace("local", "within- or cross-excerpt") + MULTI_EVIDENCE_READING
+    prompt = template.format(
         source=triplet_value(
             triplet,
             "source_entity_instance_anaphora_resolved",
@@ -140,7 +144,7 @@ def validate_triplet(client, provider: str, model: str, triplet: dict) -> str:
             "target_entity_instance",
         ),
         target_type=triplet_value(triplet, "target_entity_type"),
-        paragraph=triplet_value(triplet, "paragraph"),
+        paragraph=evidence_text(triplet),
     )
 
     return generate_label(client, provider, model, prompt)

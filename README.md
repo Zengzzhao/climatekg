@@ -132,97 +132,100 @@ python neo4j_v2.py
 python upload_neo4j.py
 ```
 
-## 使用 Markdown 和 DeepSeek 处理科学计量论文
+## 科学计量论文：实体优先、候选优先的证据抽取
 
-当前新增入口直接读取你提供的 Markdown，不上传或解析 PDF，也不需要 olmOCR。它使用中文科学计量提示词，适配 KARMA 的指标抽取任务。
+入口 `extraction/extract_md_deepseek.py` 读取已有 Markdown，使用项目 `.env` 中的 DeepSeek 配置。
+实体类型是 Paper 和 Indicator；八种关系均独立多标签判定。
 
-在 `extraction/.env` 中配置：
+当前顺序为：
 
-```dotenv
-DEEPSEEK_API_KEY=你的 DeepSeek API 密钥
-DEEPSEEK_BASE_URL=https://api.deepseek.com
-DEEPSEEK_MODEL=deepseek-chat
+1. 抽取论文元数据，确定当前 Paper 身份。
+2. 抽取 Indicator 实体清单。
+3. 将全文、Paper 身份和实体清单交给关系候选请求，只生成端点与关系标签，尚不抽证据。
+4. 独立抽取指标定义、公式和局限性；它们不作为关系证据的隐式来源。
+5. 本体检查实体清单中的端点、类型和方向。
+6. 根据每条候选关系的条件路径检索原文，批量标注可逐字定位的证据角色。
+7. 程序按新增条件覆盖、文本成本和重复程度选择证据；完整覆盖一条路径后调用 Validator。
+8. 不充分时只扩展一次检索池；最后独立调用 Evaluator，仅用于评测。
+
+```mermaid
+flowchart TD
+  A[Markdown全文] --> M[论文身份]
+  M --> E[Indicator实体清单]
+  E --> C[基于实体清单生成多标签候选]
+  C --> O[端点与本体检查]
+  O --> R[按关系条件检索原文池]
+  R --> W[批量标注角色与原文引句]
+  W --> S[条件路径约束的证据集合选择]
+  S --> V[完整路径与Validator复核]
+  V -- 证据不足且尚未扩展 --> R
+  V -- 结束 --> J[独立Evaluator与结果统计]
 ```
+
+关系证据使用 `evidence` 数组，每个元素是一段原文及其定位信息：
+
+```json
+{
+  "source_entity_instance": "A",
+  "source_entity_type": "Indicator",
+  "relation": "improves_on",
+  "target_entity_instance": "B",
+  "target_entity_type": "Indicator",
+  "evidence": [
+    {"id": "e0001", "text": "原文片段", "section": "Methods", "start": 100, "end": 104}
+  ]
+}
+```
+
+上述是字段示意；实际偏移必须与输入原文严格一致。新流程不输出关系 `paragraph` 字符串。
+指标细节的 evidence 也为数组，其元素是各段原文字符串。旧字符串证据仅作为历史文件的读取兼容。
+
+证明路径允许替代分支。例如 improves_on 可以由“明确指出A针对B的指定缺陷提出改进”支持，
+也可由“直接来源于B＋B的指定缺陷＋A针对该缺陷的修复”联合支持；不能仅凭数值更高或相关性推断。
+derived_from 还要求实质构造变化，不能把评价层级变更直接认作充分衍生证据。
 
 运行：
 
 ```bash
-cd extraction
-python extract_md_deepseek.py \
-  --markdown "/路径/论文.md" \
-  --paper-id paper_001 \
-  --date 2026-11-02
+.venv/bin/python extraction/extract_md_deepseek.py \
+  --markdown "/路径/论文.md" --paper-id paper_001 --date 2026-11-03 \
+  --output-root reports/my_condition_paths/pipeline
 ```
 
-如果已有同名结果，需要加 `--force` 覆盖。当前抽取流程（已按需求移除原 Gemini 的筛选分支）：
+默认开启条件路径选择。`--no-relation-evidence` 使用同一候选/角色标注/Validator下的Top-k选择消融，
+不再表示旧版“独立抽取关系与单个证据段落”的架构。`--evidence-rounds 0` 关闭唯一的一次缺口扩展，
+默认1。单次选择最多6段、14000字符，首轮检索12个单元。
 
-1. 抽取论文书目信息：标题、作者、DOI、年份。
-2. 直接抽取指标定义、公式和局限性；缺失内容返回空列表。
-3. 独立抽取 `Indicator` 实体。
-4. 独立抽取关系三元组和证据段落。
-5. 合并结果，补全紧邻的公式证据，执行科学计量本体检查和 Markdown 证据核验。
-6. 逐条调用 DeepSeek Validator，判断证据是否支持关系，添加 valid 标志。
-7. 逐条调用独立 Evaluator，使用科学计量评估提示词重新判断，添加 eval 标志。
+输出阶段目录仍为 extracted_papers、ontology_conformed_papers、evidence_validated_papers、
+validated_papers、evaluated_papers。前两阶段的 evidence 可以为空数组；证据阶段才写入原文片段。
+最终保留口径为 ontology_conformed、evidence_validated、valid 全为true。
+Evaluator的eval不参与选择、补证或保留，只计算 C_triplet：保留结果中eval=true的比例。
 
-科学计量实体类型为 `Paper` 和 `Indicator`，关系包括 `proposes`、`modifies`、`applies`、`variant_of`、`derived_from`、`improves_on`、`alternative_to` 和 `component_of`。证据必须来自输入 Markdown；程序不会下载 Markdown 中的图片链接。
+代码分工：
 
-为避免证据停在 “The formula is shown below:” 却遗漏下一行公式，入口默认在抽取后执行
-`local_formula_evidence.py` 的确定性边界补全：仅当证据以“公式如下/公式见下文”等提示结束、
-且能在原文唯一精确定位时，追加紧邻的最多两块显示公式（`$$...$$`、`\[...\]` 或
-math/latex 代码块）和一段以 where/with/in which/式中/其中开头的变量说明。
-新增部分最多 2000 字符、40 个换行；不会跳过正文、标题或图片去寻找公式，也不按公式编号回查。
-补全后的 `paragraph` 仍是连续原文，供证据核验、Validator 和 Evaluator 共同使用；
-原证据保存在 `paragraph_original`，补全规则和字符偏移保存在 `local_formula_completion`。
-该步骤不新增 LLM 请求，不更改关系标签，也不会自动把 valid/eval 设为 true。
+- `evidence_index.py`：原文切分、偏移和稀疏检索。
+- `evidence_selection.py`：关系证明路径、覆盖增益/成本/冗余的确定性选择算法。
+- `relation_evidence.py`：角色标注、一次缺口反馈和最终Validator的简化流程。
+- `evidence_schema.py`：证据数组格式、精确来源核验与历史兼容。
 
-这是 baseline 的局部证据完整性修复。添加 `--no-local-formula-completion` 可关闭该步骤，
-复现旧版证据行为；建议新旧结果使用不同 `--output-root` 保存。既有 JSON 与实验报告不会自动改写，
-需重新运行入口后才能得到基于新证据的 valid/eval 与 C_triplet。
+测试和新实验：
 
-当前 baseline 另包含以下提示词与模块修正，阶段顺序和四次抽取请求保持不变：
-
-- 实体与关系仍独立抽取；统一指标命名规则，关系证据要求复制完整的单个自然段及紧邻公式。
-  不按关系类型触发检索，不拼接不同章节，也不把指标细节字段当作额外关系证据。
-- 抽取、Validator、Evaluator 共用明确的关系定义。局部 we/this study 可指当前论文，
-  但不能把被引论文的贡献归为本文；复合指标的组成方向与方法衍生、相关与替代分别区分。
-- 本体模块仅在名称经 Unicode、空白、连字符规范化后唯一匹配时修正排版差异，
-  不用模糊相似度猜别名，不把缺失端点自动加入实体清单。对称关系规范方向；
-  同篇论文提出并实际应用同一指标不再被错误视为互斥，variant_of/derived_from 仍互斥。
-- DeepSeek 请求固定 temperature=0。保留 `validation_response`、`evaluation_response`；
-  非 valid/invalid 的响应会报错，避免将格式错误混算为错误关系。
-
-修改评估提示词后，应使用同一固定 Evaluator 重评新旧候选，再比较各阶段 C_triplet；
-不要将旧裁判的低分直接与新裁判的高分视作抽取改进。小规模多轮实验及原始阶段文件位于
-`reports/baseline_optimization_2026-11-02/`（第一版）与
-`reports/baseline_optimization_v2_2026-11-02/`（当前第二版）。这些是五篇开发集上的结果，
-不代表复现作者在2,000篇气候论文上的指标或人工一致性。
-最终增加了组成关系反向/变体混淆的局部判定检查；固定最终裁判后，对第二版三轮全部候选
-重新执行后续阶段，完整报告与最终代码快照位于
-`reports/baseline_optimization_final_2026-11-02/`。这是固定候选重放，不是又一次整篇抽取，
-也不是根据 eval 挑选关系；旧候选同样用最终裁判重新评估，并保留历史判定供比较。
-
-后续针对前两阶段的优化保持 Validator/Evaluator、关系定义和所有评分代码不变，
-重整了实体命名及单段原文支持的抽取提示词，并为本体名称匹配补充了数学定界符和简单下标括号的
-排版等价规范化（例如 `$x_{d}$-index` 与 `x_d-index`）；下标值不同或匹配歧义仍不接受。
-没有添加关系驱动检索、跨章节证据、候选预筛选或新的模型请求。
-本轮三个配置各跑五篇三轮，最终保留第一版提示词与数学排版修正的组合；
-额外长示例导致下降的第二版已撤回。全部结果、失败配置和固定裁判校验见
-`reports/early_stage_optimization_final_2026-11-02/report.md`，
-生产代码快照见同目录 `frozen_code/`。旧实验结果保留，不自动改写。
-
-脚本默认关闭 DeepSeek 思考模式，把生成额度留给结构化 JSON；可以用 `--thinking enabled` 开启。`--max-tokens` 是每次模型请求的生成上限，默认值为 16384。若模型返回 `length`，程序会拒绝保存不完整结果。
-
-输出文件为：
-
-```text
-output/extracted_papers/<date>/<paper-id>.json
-output/ontology_conformed_papers/<date>/<paper-id>.json
-output/evidence_validated_papers/<date>/<paper-id>.json
-output/validated_papers/<date>/<paper-id>.json
-output/evaluated_papers/<date>/<paper-id>.json
+```bash
+.venv/bin/python -m unittest discover -s extraction -p 'test*.py'
+.venv/bin/python extraction/experiments/condition_paths.py fixed --workers 2
+.venv/bin/python extraction/experiments/condition_paths.py calibration --workers 2
+.venv/bin/python extraction/experiments/condition_paths.py fresh --workers 2
 ```
 
-当前科学计量入口已经适配抽取、本体检查和证据核验。`validation_agent.py` 和 `evaluation_agent.py` 分别使用科学计量验证与独立评估提示词，不需要 `domain` 字段；实体对齐、向量生成和 Neo4j 构建仍是气候领域实现，尚未迁移到 `Paper`/`Indicator` 本体。
+实验需要将已授权的五篇论文及证据发送至配置的DeepSeek服务。已完成请求按完整请求内容缓存，
+代码变化后使用新的 `--output`；相同请求可以通过 `--cache-root` 复用，但不计为新的模型重复试验。
+`fixed` 保留冻结局部基线，重做所有原拒绝项；`fresh` 将同一次新实体约束抽取的候选分别交给cover与Top-k。
+Evaluator提示词与上轮报告逐字核对保持一致，不以其结果筛选关系。
+
+最新方法定位与近期文献见 `reports/condition_paths_2026-11-03/research.md`。
+实验记录见同目录报告；原始2026-11-02各版结果和代码快照保持不变。
+旧实验脚本依赖旧版API，应使用其冻结代码复现，不能直接将旧字符串流程和当前数组流程混合比较。
+当前评分是模型辅助的开发集结果，尚无专家金标准或独立留出测试集。
 
 ## 许可证
 
@@ -238,59 +241,3 @@ output/evaluated_papers/<date>/<paper-id>.json
   year      = {2026}
 }
 ```
-
-科学计量输出不再包含 domain、extraction_provenance 或气候占位字段（model、obs_and_metrics、uri、venue、authors、abstract、keywords、concepts、referenced_works）。作者保存在 author_names。不再执行指标筛选，也不输出 indicator_screening 和 paper_screening；每篇论文固定执行四次抽取请求。本体批处理入口默认科学计量规则；如在 Python 中显式传入旧本体集合，仍可调用旧气候检查。Validator/Evaluator 直接使用科学计量提示词，不再自动切换到气候领域。已有 JSON 文件不会被自动改写，重新抽取时生成精简结构。
-
-当前入口自动执行“抽取 → 本体检查 → 证据字符匹配 → LLM 语义验证 → 独立评估”。Validator
-复用 validation_agent.py 的 validate_data/validate_triplet，默认使用抽取模型和同一 DeepSeek
-配置，可用 --validator-model 指定另一个 DeepSeek 模型。每条三元组调用一次，包括本体或
-证据检查未通过的项；所有判定分别保留，不以 valid 覆盖其他标志。Validator 只读取三元组
-及 paragraph，不重新读取全文，也不验证 indicator_details 的数学正确性。原气候 Evidence
-validator 也使用局部模糊字符匹配；新入口保留缺失 MD 报错和图表证据必须匹配的更严格规则。
-
-Validator 失败时前三阶段文件仍保留，第四阶段不会写入不完整结果；可单独运行
-`python validation_agent.py --date <date> --model deepseek-flash` 继续验证已有证据阶段结果，
-已有验证结果需加 --force。完整入口的覆盖检查包含五个阶段。
-Evaluator 使用 prompts_zh.py 的 EVALUATION_PROMPT，重新检查实体身份、关系方向、贡献归属、否定和适用条件。
-它与 Validator 分别发起模型请求，输入不含先前 valid/ontology_conformed/evidence_validated 判定，
-但默认使用同一模型；独立指请求与评估提示词独立，不代表使用不同模型或独立事实真值。
-可用 --evaluator-model 指定其他 DeepSeek 模型。全部关系都会重新评估，包括 valid=false 的项，
-旧标志保留，新增 eval=true/false。最终入图应结合所有判定，不能仅以 eval 代替 valid。
-Evaluator 失败时前四阶段文件保留，第五阶段不会保存不完整结果。
-可运行 `python evaluation_agent.py --date <date> --model deepseek-flash` 单独评估既有验证结果；
-已有评估结果需加 --force。此流程仍不执行实体对齐或 Neo4j 入库。
-
-## 表 3 同口径：C_triplet (%)
-
-参考论文第 4.2 节及表 3，每行统计截至该阶段的累计保留三元组：
-
-`C_triplet (%) = 100 × 该行保留结果中 eval=true 的条数 / 该行 Output Triplets`
-
-四行依次为：全部抽取结果、ontology_conformed=true、再加 evidence_validated=true、
-再加 valid=true。Evaluator 的 eval 是裁判标签，不参与生成这四行的筛选条件。
-因此 Validator 行的分母不是全部候选，也不是 eval=true 的条数。
-这是基于独立评估调用的 precision-like 指标，不是人工标注准确率或召回率；
-若 Validator 和 Evaluator 使用同一模型，二者判断仍可能存在相关性。
-
-完整入口在第五阶段评估完成后自动显示表格，并将 JSON、CSV、Markdown 导出到：
-
-```text
-output/reports/<date>/<paper-id>/table3.{json,csv,md}
-```
-
-对已有 Evaluator 结果可离线重算（无 API 调用）：
-
-```bash
-cd extraction
-python triplet_metrics.py --dates 2026-11-02 --paper-id paper_001 \
-  --report-dir output/reports/2026-11-02/paper_001
-
-# 多批次合并：不传 --paper-id 则统计指定批次内所有论文
-python triplet_metrics.py --dates 2026-11-02 2026-11-03 \
-  --report-dir output/reports/combined
-```
-
-每个日期分区应仅保存该实验的一份最终结果；基线和实验副本应分开目录或使用
---paper-id，避免合并时重复计数。统计以抽取记录为单位，不做图边去重；跨论文汇总
-先累加条数再除，不对论文百分比简单平均。缺失或非布尔阶段标志会报错；空集合
-的百分比显示 N/A（JSON 为 null），不会把尚未评估的数据当成错误三元组。

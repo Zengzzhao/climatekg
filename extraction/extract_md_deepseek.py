@@ -7,20 +7,18 @@ from pathlib import Path
 
 from dotenv import load_dotenv
 from openai import OpenAI
-from pydantic import BaseModel, ConfigDict
+from pydantic import BaseModel, ConfigDict, Field
 from typing import Literal
 
-from models import Kg_Extraction_Model
 from prompts_zh import (
     SYSTEM_INSTRUCTION,
     METADATA_EXTRACTION, INDICATOR_DETAILS_PROMPT,
-    ENTITY_EXTRACTION_PROMPT, KG_LINKING_PROMPT,
+    ENTITY_EXTRACTION_PROMPT, KG_LINKING_PROMPT, CANDIDATE_RELATIONS_PROMPT,
 )
 from scientometrics_ontology import annotate_scientometrics
-from evidence_validation_agent import partial_ratio_score, DEFAULT_THRESHOLD
-from local_formula_evidence import complete_local_formula_evidence
-from validation_agent import validate_data
 from evaluation_agent import evaluate_data
+from relation_evidence import collect_data
+from evidence_schema import verify_units
 from triplet_metrics import table3, markdown_table, write_report
 
 SCRIPT_DIR = Path(__file__).resolve().parent
@@ -33,7 +31,7 @@ class IndicatorEntity(BaseModel):
 
 class SupportedDetail(BaseModel):
     text: str
-    evidence: str
+    evidence: list[str]
 
 
 class IndicatorDetails(BaseModel):
@@ -56,9 +54,32 @@ class EntityExtraction(BaseModel):
     entities_extracted: list[IndicatorEntity]
 
 
+class RelationCandidate(BaseModel):
+    model_config = ConfigDict(extra="forbid")
+    source_entity_instance: str
+    source_entity_type: Literal["Paper", "Indicator"]
+    relation: Literal["proposes", "modifies", "applies", "variant_of", "derived_from", "improves_on", "alternative_to", "component_of"]
+    target_entity_instance: str
+    target_entity_type: Literal["Indicator"]
+
+
 class RelationExtraction(BaseModel):
     model_config = ConfigDict(extra="forbid")
-    kg_extraction_triplets: list[Kg_Extraction_Model]
+    kg_extraction_triplets: list[RelationCandidate]
+
+
+class EvidenceSpan(BaseModel):
+    model_config = ConfigDict(extra="forbid")
+    id: str
+    text: str
+    section: str
+    start: int
+    end: int
+
+
+class ScientificTriplet(RelationCandidate):
+    model_config = ConfigDict(extra="allow")
+    evidence: list[EvidenceSpan] = Field(default_factory=list)
 
 
 class DetailExtraction(BaseModel):
@@ -67,7 +88,8 @@ class DetailExtraction(BaseModel):
 
 
 class Extraction(PaperInformation, EntityExtraction, RelationExtraction, DetailExtraction):
-    """合并后的输出结构，保持现有下游字段兼容。"""
+    """Merged output with array evidence; downstream flags are retained."""
+    kg_extraction_triplets: list[ScientificTriplet]
 
 
 def request_stage(client, model, text, max_tokens, thinking, stage, schema, instructions, context=None):
@@ -102,52 +124,39 @@ def request_stage(client, model, text, max_tokens, thinking, stage, schema, inst
 
 
 def extract(client, model: str, text: str, max_tokens: int, thinking: str = "disabled",
-            complete_formulas: bool = True) -> dict:
-    """顺序抽取论文信息、指标细节、实体和关系证据，不进行筛选。"""
+            ) -> dict:
+    """Metadata -> entities -> entity-constrained candidates -> indicator details."""
     def call(stage, schema, instructions, context=None):
         return request_stage(client, model, text, max_tokens, thinking,
                              stage, schema, instructions, context)
 
     metadata = call("论文信息", PaperInformation, METADATA_EXTRACTION)
-    details = call("指标定义、公式与局限性", DetailExtraction,
-        INDICATOR_DETAILS_PROMPT.replace("已抽取指标", "原文明确命名的指标")
-        .replace("必须与实体清单一致", "使用原文名称")
-        .replace("已抽取", "原文中的"))
     entities = call("实体", EntityExtraction, ENTITY_EXTRACTION_PROMPT)
     paper_name = metadata["title"] or metadata["doi"]
     paper_entity = ({"entity_instance": paper_name, "entity_type": "Paper"} if paper_name else None)
-    # Like Gemini's KG call, this request does not consume the extracted entity list.
-    context = {"title": metadata["title"], "doi": metadata["doi"], "paper_entity": paper_entity}
-    relation_prompt = KG_LINKING_PROMPT.replace(
-        "Indicator 端点必须与 entities_extracted 中的名称完全一致，实体清单本身不是关系证据。",
-        "独立根据原文识别 Indicator 关系端点，使用原文名称；不要依赖另一轮实体抽取结果。")
-    relation_prompt = relation_prompt.replace("以实体清单中靠前的指标为源", "以原文首次出现更早的指标为源")
-    relations = call("关系与证据", RelationExtraction, relation_prompt, context)
+    context = {"title": metadata["title"], "doi": metadata["doi"], "paper_entity": paper_entity,
+               "entities_extracted": entities["entities_extracted"]}
+    relations = call("关系候选（尚无证据）", RelationExtraction, CANDIDATE_RELATIONS_PROMPT, context)
+    detail_prompt = (INDICATOR_DETAILS_PROMPT.replace("已抽取指标", "实体清单中的指标")
+                    + "\n所有 evidence 字段必须是原文字符串数组，每个独立片段为一个元素。")
+    details = call("指标定义、公式与局限性", DetailExtraction, detail_prompt, context)
     result = Extraction.model_validate({**metadata, **entities, **relations, **details}).model_dump()
-    # Cross-stage endpoint checks belong to the subsequent conformance stage.
     result["paper_entity"] = paper_entity
-    if complete_formulas:
-        count = complete_local_formula_evidence(result, text)
-        print(f"局部公式证据补全：{count} 条（仅紧邻原文）", flush=True)
+
     return result
 
 
-def verify_evidence(data: dict, markdown: str, threshold: float) -> None:
+def verify_evidence(data: dict, markdown: str) -> None:
     if not markdown.strip():
         raise ValueError("Markdown is empty; evidence cannot be verified.")
     for triplet in data["kg_extraction_triplets"]:
-        paragraph = triplet.get("paragraph", "")
-        triplet["evidence_validated"] = bool(
-            paragraph.strip() and partial_ratio_score(paragraph, markdown) >= threshold
-        )
-
+        triplet["evidence_validated"] = verify_units(triplet, markdown)
     for detail in data.get("indicator_details", []):
         for kind in ("definitions", "formulas", "limitations"):
             for claim in detail[kind]:
-                claim["evidence_validated"] = bool(
-                    claim["text"].strip() and claim["evidence"].strip()
-                    and claim["text"] in claim["evidence"] and claim["evidence"] in markdown
-                )
+                evidence = claim["evidence"]
+                claim["evidence_validated"] = bool(claim["text"].strip() and evidence and all(e in markdown for e in evidence)
+                    and any(claim["text"] in e for e in evidence))
 
 
 def write_json(path: Path, data: dict) -> None:
@@ -171,13 +180,13 @@ def main():
     parser.add_argument("--max-tokens", type=int, default=16384)
     parser.add_argument("--thinking", choices=("disabled", "enabled"), default="disabled",
                         help="DeepSeek thinking mode; disabled keeps the budget for extraction output")
-    parser.add_argument("--threshold", type=float, default=DEFAULT_THRESHOLD)
-    parser.add_argument("--no-local-formula-completion", action="store_true",
-                        help="Disable adjacent formula completion to reproduce the original baseline")
+    parser.add_argument("--relation-evidence", action=argparse.BooleanOptionalAction, default=True,
+                        help="Use condition-path coverage selection (default); --no-relation-evidence uses Top-k ablation")
+    parser.add_argument("--evidence-rounds", type=int, default=1, choices=(0, 1))
     parser.add_argument("--force", action="store_true")
     args = parser.parse_args()
-    if not 0 <= args.threshold <= 100 or args.max_tokens <= 0:
-        parser.error("threshold must be 0..100 and max-tokens must be positive")
+    if args.max_tokens <= 0:
+        parser.error("max-tokens must be positive")
     if Path(args.date).name != args.date or args.date in (".", ".."):
         parser.error("date must be a single directory name")
     paper_id = args.paper_id or args.markdown.stem
@@ -200,19 +209,19 @@ def main():
     if not api_key:
         parser.error("Set DEEPSEEK_API_KEY in extraction/.env")
     with OpenAI(api_key=api_key, base_url=base_url, timeout=180, max_retries=2) as client:
-        data = extract(client, args.model, markdown, args.max_tokens, args.thinking,
-                       complete_formulas=not args.no_local_formula_completion)
+        data = extract(client, args.model, markdown, args.max_tokens, args.thinking)
     write_json(paths[0], data)
     annotate_scientometrics(data)
     write_json(paths[1], data)
-    verify_evidence(data, markdown, args.threshold)
-    write_json(paths[2], data)
     validator_model = args.validator_model or args.model
-    print(f"正在进行语义验证：model={validator_model}，逐条检查全部关系", flush=True)
+    print(f"关系证据检索与验证：model={validator_model}", flush=True)
     with OpenAI(api_key=api_key, base_url=base_url, timeout=180, max_retries=2) as client:
-        total, valid = validate_data(data, client, "deepseek", validator_model)
+        total, valid = collect_data(data, markdown, client, validator_model,
+            method="cover" if args.relation_evidence else "topk", max_rounds=args.evidence_rounds)
+    verify_evidence(data, markdown)
+    write_json(paths[2], data)
     write_json(paths[3], data)
-    print(f"语义验证通过：{valid} / {total}", flush=True)
+    print(f"语义验证通过：{sum(t['valid'] for t in data['kg_extraction_triplets'])} / {total}", flush=True)
     evaluator_model = args.evaluator_model or args.model
     print(f"正在进行独立评估：model={evaluator_model}，逐条重新判断全部关系", flush=True)
     with OpenAI(api_key=api_key, base_url=base_url, timeout=180, max_retries=2) as client:

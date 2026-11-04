@@ -31,7 +31,7 @@ Indicator -> Indicator:
 - variant_of: source retains target's basic measurement structure and changes weighting, normalization,
   parameters or application scope. An explicit variant/adaptation statement with identifiable endpoints suffices.
 - derived_from: source directly extends target with a substantive change beyond a simple parameter/weight variant.
-  Do not assign both derived_from and variant_of to the same ordered pair.
+  Assess each label independently; multiple labels may coexist when each definition is supported.
 - improves_on: source explicitly addresses a specified limitation of target; preserve the stated objective,
   conditions and distinction between intended improvement and demonstrated empirical improvement.
 - alternative_to: explicit substitutability for the same evaluation goal under stated conditions.
@@ -39,7 +39,7 @@ Indicator -> Indicator:
 - component_of: source is a named indicator/score used as a DIRECT input or constituent of the target composite.
   For a composite Z = a*X + b*Y, named scores X and Y are components of Z, not the reverse.
   A method computing X is not automatically a component of Z; do not infer transitive components.
-Different Paper relations may coexist if each has its own evidence. No self-relations or invented endpoints.
+All Paper and Indicator relations are multi-label; assess support for each separately. No self-relations or invented endpoints.
 """
 
 NAME_CONVENTION = """Naming contract for BOTH independent extractions:
@@ -182,3 +182,45 @@ Shared framework membership, a list of variants, and correlation are not direct 
 """
 VALIDATION_PROMPT = VALIDATION_PROMPT.replace('Source: {source}', _DIRECT_INPUT_CHECK + '\nSource: {source}')
 EVALUATION_PROMPT = EVALUATION_PROMPT.replace('Source: {source}', _DIRECT_INPUT_CHECK + '\nSource: {source}')
+
+
+# The baseline prompt remains available; the evidence mode permits sourced cross-section reasoning.
+MULTI_EVIDENCE_READING = """
+Evidence consists of separately identified, verbatim excerpts from ONE current paper.
+Reason across excerpts only when entity identity, version, direction and attribution are consistent.
+Acronym bindings and references may be resolved across the supplied excerpts; do not import unseen facts.
+Excerpt IDs/headings are provenance, not assertions. Repetition is not additional support.
+"""
+
+def multi_evidence_evaluation_prompt():
+    return (EVALUATION_PROMPT
+            .replace('clear local anaphora', 'clear within- or cross-excerpt anaphora')
+            .replace('unambiguous local support', 'unambiguous combined support')
+            .replace('paragraph supports', 'supplied evidence supports')
+            + MULTI_EVIDENCE_READING)
+
+def multi_evidence_linking_prompt():
+    start = KG_LINKING_PROMPT.index('Single local evidence contract')
+    return KG_LINKING_PROMPT[:start] + """
+Identify supported direct candidate relations using the WHOLE paper, including cross-section reasoning.
+All eight relation types are multi-label; output each independently supported label.
+Copy one exact contiguous original paragraph as the retrieval seed in paragraph.
+This seed may supply only part of the evidence; later retrieval must find remaining support in the paper.
+Do not invent a relationship from co-occurrence, similar names or assumed indicator history.
+Keep negation, authorship and conditions. Do not concatenate excerpts into paragraph.
+For component_of preserve DIRECT input direction. No self-relations or duplicate triplets.
+For alternative_to use one canonical orientation, earlier-appearing indicator first.
+"""
+
+
+CANDIDATE_RELATIONS_PROMPT = """Generate relation CANDIDATES AFTER entity extraction.
+Use only supplied entities_extracted as Indicator endpoints, copying their names exactly.
+The supplied Paper entity is the current document. Do not invent endpoints or aliases.
+Read the full paper to propose plausible directly supported candidates, including cross-section
+relations. Do not enumerate arbitrary pairs from co-occurrence. Each label is independent.
+For each candidate output ONLY source_entity_instance, source_entity_type, relation,
+target_entity_instance and target_entity_type. DO NOT extract evidence yet: evidence
+retrieval and relation-conditioned proof selection are a separate subsequent stage.
+Do not output paragraph, evidence, confidence or a guessed explanation.
+For symmetric alternative_to output one orientation. No duplicates or self-relations.
+""" + RELATION_DEFINITIONS

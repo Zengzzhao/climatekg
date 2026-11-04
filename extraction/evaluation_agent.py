@@ -18,7 +18,8 @@ from pathlib import Path
 from typing import Iterable
 
 from dotenv import load_dotenv
-from prompts_zh import EVALUATION_PROMPT
+from prompts_zh import EVALUATION_PROMPT, multi_evidence_evaluation_prompt
+from evidence_schema import evidence_text
 from validation_agent import create_client, generate_label, resolve_model, parse_label
 from tqdm import tqdm
 
@@ -69,7 +70,8 @@ def triplet_value(triplet: dict, key: str, fallback_key: str | None = None) -> s
 
 
 def evaluate_triplet(client, provider: str, model: str, triplet: dict) -> str:
-    prompt = EVALUATION_PROMPT.format(
+    template = multi_evidence_evaluation_prompt() if "evidence" in triplet or triplet.get("evidence_units") else EVALUATION_PROMPT
+    prompt = template.format(
         source=triplet_value(
             triplet,
             "source_entity_instance_anaphora_resolved",
@@ -83,7 +85,7 @@ def evaluate_triplet(client, provider: str, model: str, triplet: dict) -> str:
             "target_entity_instance_anaphora_resolved",
             "target_entity_instance",
         ),
-        paragraph=triplet_value(triplet, "paragraph"),
+        paragraph=evidence_text(triplet),
     )
 
     return generate_label(client, provider, model, prompt)

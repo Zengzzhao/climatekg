@@ -18,6 +18,7 @@ from pathlib import Path
 from typing import Iterable
 
 from rapidfuzz import fuzz
+from evidence_schema import verify_units
 from tqdm import tqdm
 
 
@@ -71,6 +72,8 @@ def partial_ratio_score(paragraph: str, markdown_content: str) -> float:
 def validate_triplet_evidence(
     triplet: dict, markdown_content: str, threshold: float
 ) -> bool:
+    if "evidence" in triplet:
+        return verify_units(triplet, markdown_content)
     paragraph = triplet.get("paragraph", "")
     if not isinstance(paragraph, str) or not paragraph:
         return False
@@ -103,6 +106,8 @@ def validate_paper_evidence(
         raise ValueError("kg_extraction_triplets must be a list")
 
     if not markdown_path.exists():
+        if any("evidence" in t for t in triplets):
+            raise FileNotFoundError(f"Cannot ground array evidence without Markdown: {markdown_path}")
         triplet_count = mark_all_triplets_valid(paper_data)
         return triplet_count, 0, False
 
