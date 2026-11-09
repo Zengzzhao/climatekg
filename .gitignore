@@ -21,3 +21,5 @@ hf_release/
 .venv/
 
 reports/
+data_get/
+output/
