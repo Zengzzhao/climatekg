@@ -1,0 +1,4 @@
+.mineru-token
+.mineru/
+*.log
+*.json

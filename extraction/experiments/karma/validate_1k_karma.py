@@ -18,7 +18,7 @@ from tqdm import tqdm
 
 EXTRACTION_DIR = Path(__file__).resolve().parents[2]
 sys.path.insert(0, str(EXTRACTION_DIR))
-from prompts_deprecated import GPT_VALIDATION_PROMPT  # noqa: E402
+from experiments.climate_baseline.prompts_deprecated import GPT_VALIDATION_PROMPT  # noqa: E402
 
 MODEL = "gpt-5-mini-2025-08-07"
 

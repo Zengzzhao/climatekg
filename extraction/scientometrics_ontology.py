@@ -17,6 +17,7 @@ def _name_key(name):
 
 PAPER_RELATIONS = {'proposes', 'modifies', 'applies'}
 INDICATOR_RELATIONS = {'variant_of', 'derived_from', 'improves_on', 'alternative_to', 'component_of'}
+EXCLUSIVE_RELATIONS = frozenset({'variant_of', 'derived_from'})
 RELATIONSHIPS = ({('Paper', 'Indicator', r) for r in PAPER_RELATIONS}
                  | {('Indicator', 'Indicator', r) for r in INDICATOR_RELATIONS})
 
@@ -48,5 +49,34 @@ def annotate_scientometrics(data):
             if rank[s] > rank[d]:
                 t['source_entity_instance'], t['target_entity_instance'] = d, s
         t['ontology_conformed'] = bool(valid)
-    # Every relation is independent: multiple supported labels may coexist.
+    # Candidate hypotheses may conflict; enforce exclusion after independent validation.
     return sum(t['ontology_conformed'] for t in triplets), sum(not t['ontology_conformed'] for t in triplets)
+
+
+def enforce_relation_exclusivity(data):
+    """Gate unresolved competing survivors without using Evaluator or preferring a label.
+
+    Unioned discovery hypotheses are allowed to compete through evidence validation.
+    If both exclusive labels survive for the same typed, ordered pair, neither is
+    ontology-conformant for final retention. Preserve Validator/evidence verdicts
+    and record the conflict for adjudication rather than treating either as false.
+    Run after validation and before evaluation/final retention.
+    """
+    groups = {}
+    for t in data['kg_extraction_triplets']:
+        if t['relation'] in EXCLUSIVE_RELATIONS and all(
+                t.get(f) for f in ('ontology_conformed', 'evidence_validated', 'valid')):
+            key = tuple(t[f] for f in ('source_entity_type', 'source_entity_instance',
+                                      'target_entity_type', 'target_entity_instance'))
+            groups.setdefault(key, []).append(t)
+    conflicts = 0
+    for rows in groups.values():
+        if {t['relation'] for t in rows} != EXCLUSIVE_RELATIONS:
+            continue
+        conflicts += 1
+        for t in rows:
+            t['ontology_conformed'] = False
+            t['relation_constraint_conflict'] = dict(
+                reason='mutually_exclusive_labels', labels=sorted(EXCLUSIVE_RELATIONS),
+                resolution='unresolved; neither retained; requires evidence-based adjudication')
+    return conflicts

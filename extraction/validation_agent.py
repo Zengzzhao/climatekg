@@ -12,6 +12,7 @@ import argparse
 import concurrent.futures
 import datetime as dt
 import json
+import json
 import os
 import re
 from functools import partial
@@ -72,7 +73,7 @@ def triplet_value(triplet: dict, key: str, fallback_key: str | None = None) -> s
 def resolve_model(model_arg: str) -> tuple[str, str]:
     if model_arg.lower() == "gpt":
         return "gpt", DEFAULT_GPT_MODEL
-    if model_arg.lower().startswith("deepseek"):
+    if model_arg.lower().startswith(("deepseek", "cuc/")):
         return "deepseek", model_arg
     return "gemini", model_arg
 
@@ -127,9 +128,13 @@ def parse_label(response: str) -> bool:
 
 
 def validate_triplet(client, provider: str, model: str, triplet: dict) -> str:
+    return generate_label(client, provider, model, validation_prompt(triplet))
+
+
+def validation_prompt(triplet: dict) -> str:
     template = VALIDATION_PROMPT
     if "evidence" in triplet or triplet.get("evidence_units"):
-        template = template.replace("local", "within- or cross-excerpt") + MULTI_EVIDENCE_READING
+        template += MULTI_EVIDENCE_READING
     prompt = template.format(
         source=triplet_value(
             triplet,
@@ -147,7 +152,47 @@ def validate_triplet(client, provider: str, model: str, triplet: dict) -> str:
         paragraph=evidence_text(triplet),
     )
 
-    return generate_label(client, provider, model, prompt)
+    return prompt
+
+
+def parse_feedback(content: str) -> dict:
+    """Malformed output is an execution error, never a semantic rejection."""
+    result = json.loads(content)
+    if not isinstance(result, dict) or result.get('verdict') not in ('valid', 'invalid'):
+        raise ValueError('Validator feedback must contain a valid/invalid verdict')
+    if not isinstance(result.get('reason'), str) or not result['reason'].strip():
+        raise ValueError('Validator feedback must contain a reason')
+    for field in ('missing_evidence', 'search_queries'):
+        values = result.get(field)
+        if not isinstance(values, list) or any(not isinstance(v, str) or not v.strip() for v in values):
+            raise ValueError(f'Validator feedback must contain a string array: {field}')
+    if result['verdict'] == 'invalid' and not result['missing_evidence']:
+        raise ValueError('Rejected evidence requires a concrete evidence requirement')
+    if result['verdict'] == 'invalid' and not result['search_queries']:
+        raise ValueError('Rejected evidence requires targeted retrieval queries')
+    if result['verdict'] == 'valid' and (result['missing_evidence'] or result['search_queries']):
+        raise ValueError('Valid evidence must not report missing content')
+    return result
+
+
+def validate_triplet_with_feedback(client, model: str, triplet: dict) -> dict:
+    """New pipeline: one verdict plus actionable evidence needs in one call."""
+    prompt = validation_prompt(triplet).replace('只回答 valid 或 invalid，不解释。', '')
+    instruction = '''只返回 JSON：{"verdict":"invalid","reason":"具体判定理由","missing_evidence":["待核查的原文内容"],"search_queries":["定向检索词"]}。
+invalid 时说明缺口或反证，用准确指标名写出需核查的内容，并给出原文语言的检索词。
+不假造预期引文。若有矛盾，补检须核查反证或消歧，不预设关系成立。
+valid 时两个数组均为空。诊断只用于补检。'''
+    response = client.chat.completions.create(model=model, temperature=0, max_tokens=2000,
+        response_format={'type':'json_object'}, extra_body={'thinking':{'type':'disabled'}},
+        messages=[{'role':'system','content':instruction}, {'role':'user','content':prompt}])
+    choice = response.choices[0]
+    if choice.finish_reason != 'stop':
+        raise ValueError(f'Validator feedback incomplete: {choice.finish_reason}')
+    result = parse_feedback(choice.message.content or '')
+    result['model'] = response.model
+    result['response_id'] = response.id
+    result['usage'] = response.usage.model_dump() if response.usage else None
+    return result
 
 
 def validate_data(data: dict, client, provider: str, model: str) -> tuple[int, int]:

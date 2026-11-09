@@ -1,0 +1,13 @@
+{
+  "base_commit": "cb2e962b1ab836f8ba1060c25895124f43dd1b57",
+  "source_sha256": {
+    "models": "db40daea4c53ba271318db456373b49b93f87cf388f849452978d4d0e87cc69d",
+    "scientometrics_ontology": "c5ccf4e3d53626e692ce0a2e655f0f100d74e7714f3606b0193862a9b911bba2",
+    "evidence_validation_agent": "46a71b0c4a8997d5ebee2ef38d71d544a70a794be4f96049013361be06c429d7",
+    "local_formula_evidence": "40d1ff0de7ef026d6443332d53ff8ff2d36b3b18c53e62fdde9f80b2cb91e8ab",
+    "validation_agent": "be7e67ddea033585881130cff6e565b8e6c08d1a2cd6db18c8337952ab60b287",
+    "evaluation_agent": "a7ddc97fb0f8c9c8d077c1d169da9a958661a7d9c58822f3ccc95de551ff8bdf",
+    "triplet_metrics": "f9211f0512c46ae80f42b71b062ec01c1ff9a836c4957d24d83550e16cccbe80",
+    "extract_md_deepseek": "ad48d285ba5c1fa9316554c8703cd4986743788ad155db951932d0437a099fd4"
+  }
+}

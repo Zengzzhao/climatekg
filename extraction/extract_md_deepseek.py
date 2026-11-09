@@ -138,7 +138,7 @@ def extract(client, model: str, text: str, max_tokens: int, thinking: str = "dis
                "entities_extracted": entities["entities_extracted"]}
     relations = call("关系候选（尚无证据）", RelationExtraction, CANDIDATE_RELATIONS_PROMPT, context)
     detail_prompt = (INDICATOR_DETAILS_PROMPT.replace("已抽取指标", "实体清单中的指标")
-                    + "\n所有 evidence 字段必须是原文字符串数组，每个独立片段为一个元素。")
+                    + "\nevidence 是原文字符串数组，每段一个元素。")
     details = call("指标定义、公式与局限性", DetailExtraction, detail_prompt, context)
     result = Extraction.model_validate({**metadata, **entities, **relations, **details}).model_dump()
     result["paper_entity"] = paper_entity
@@ -181,7 +181,7 @@ def main():
     parser.add_argument("--thinking", choices=("disabled", "enabled"), default="disabled",
                         help="DeepSeek thinking mode; disabled keeps the budget for extraction output")
     parser.add_argument("--relation-evidence", action=argparse.BooleanOptionalAction, default=True,
-                        help="Use condition-path coverage selection (default); --no-relation-evidence uses Top-k ablation")
+                        help="Use joint model evidence selection (default); --no-relation-evidence uses Top-k ablation")
     parser.add_argument("--evidence-rounds", type=int, default=1, choices=(0, 1))
     parser.add_argument("--force", action="store_true")
     args = parser.parse_args()
@@ -217,7 +217,7 @@ def main():
     print(f"关系证据检索与验证：model={validator_model}", flush=True)
     with OpenAI(api_key=api_key, base_url=base_url, timeout=180, max_retries=2) as client:
         total, valid = collect_data(data, markdown, client, validator_model,
-            method="cover" if args.relation_evidence else "topk", max_rounds=args.evidence_rounds)
+            method="coherent" if args.relation_evidence else "topk", max_rounds=args.evidence_rounds)
     verify_evidence(data, markdown)
     write_json(paths[2], data)
     write_json(paths[3], data)
