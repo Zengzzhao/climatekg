@@ -2,12 +2,11 @@
 This file contains utility functions for information extraction tasks.
 """
 
-from prompts_deprecated import NO_EXPLANATION_PROMPT
+from experiments.climate_baseline.prompts_deprecated import NO_EXPLANATION_PROMPT
 from google.genai import types, Client
-from models import Kg_Extraction_Model,Entity_Extraction_Model
-import PyPDF2
+from experiments.climate_baseline.models import Kg_Extraction_Model,Entity_Extraction_Model
 from sklearn.metrics.pairwise import cosine_similarity
-from consts import EMBEDDING_MATCH_ENTITIES
+from experiments.climate_baseline.consts import EMBEDDING_MATCH_ENTITIES
 import json
 import numpy as np
 # from huggingface_hub import InferenceClient
@@ -75,7 +74,7 @@ import numpy as np
 #     }
 
 #     messages = [
-#         {"role": "system", "content": "You are a helpful assistant that extracts information as per the schema."},
+#         {"role": "system", "content": "你是按指定结构抽取信息的助手。"},
 #         {"role": "user", "content": prompt}
 #     ]
 
@@ -218,6 +217,8 @@ def check_pdf(file_path):
         tuple: (status, message)
         status: 'OK', 'CORRUPTED', 'NO_PAGES', 'ERROR'
     """
+    # 仅PDF健康检查需要此依赖，不阻塞抽取入口的帮助、配置或其他工具导入。
+    import PyPDF2
     try:
         with open(file_path, 'rb') as f:
             reader = PyPDF2.PdfReader(f)

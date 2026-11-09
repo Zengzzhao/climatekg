@@ -30,6 +30,11 @@ import datetime as dt
 import io
 import json
 from pathlib import Path
+import sys
+
+EXTRACTION_ROOT = Path(__file__).resolve().parents[2]
+if str(EXTRACTION_ROOT) not in sys.path:
+    sys.path.insert(0, str(EXTRACTION_ROOT))
 
 from dotenv import load_dotenv
 from google import genai
@@ -37,22 +42,22 @@ from google.genai import types
 from pydantic import BaseModel
 from tqdm import tqdm
 
-from consts import ALL_RELATIONSHIP_SOURCE_TO_TARGET, GEMINI_MIN_CACHE_TOKEN_LIMIT
-from models import (Entity_Extraction_Model, Kg_Extraction_Model,
+from experiments.climate_baseline.consts import ALL_RELATIONSHIP_SOURCE_TO_TARGET, GEMINI_MIN_CACHE_TOKEN_LIMIT
+from experiments.climate_baseline.models import (Entity_Extraction_Model, Kg_Extraction_Model,
                     Observation_Metric_Model)
-from prompts_deprecated import (ENTITY_EXTRACTION_PROMPT, FIELD_EXTRACTION,
+from experiments.climate_baseline.prompts_deprecated import (ENTITY_EXTRACTION_PROMPT, FIELD_EXTRACTION,
                                 INNOVATION_EXTRACTION, KG_LINKING_PROMPT,
                                 METHOD_EXTRACTION, MODEL_EXTRACTION,
                                 OBSERVATION_AND_METRIC_EXTRACTION,
                                 PAPER_SCREENING_PROMPT, PROBLEM_EXTRACTION,
                                 TASK_EXTRACTION)
-from utils_deprecated import (construct_openalex_metadata_url, prompt_llm,
+from experiments.climate_baseline.utils_deprecated import (construct_openalex_metadata_url, prompt_llm,
                               validate_entity_extraction_response)
 
 # Please add relevant keys from .env.example document
-load_dotenv()
+load_dotenv(Path(__file__).resolve().parents[2] / ".env")
 
-SCRIPT_DIR = Path(__file__).resolve().parent
+SCRIPT_DIR = Path(__file__).resolve().parents[2]
 
 # Heavy structured extractions (KG/observation/entity) default to Pro for
 # quality; the merged metadata call defaults to the cheaper Flash.
@@ -62,10 +67,7 @@ DEFAULT_METADATA_MODEL = "gemini-2.5-flash"
 # before the explicit delete in process_paper runs.
 CACHE_TTL = "600s"
 
-SYSTEM_INSTRUCTION = (
-    "You are an expert in extracting information from scientific papers. Your job "
-    "is to answer the user's query based on the pdf file you have access to."
-)
+SYSTEM_INSTRUCTION = """你是科学论文信息抽取专家，根据所能访问的 PDF 文件回答用户的问题。"""
 
 # All entity types (used to filter the entity-extraction response).
 all_entity_types = set()
@@ -91,26 +93,19 @@ class Model_Screening_Model(BaseModel):
 
 # Single structured prompt for the free-text fields, replacing five separate
 # text prompts. Wording is reused verbatim from prompts_deprecated.py.
-COMBINED_METADATA_PROMPT = f"""You are extracting high-level metadata from a scientific paper related to climate modeling or Earth system science. Populate every field of the response schema using the instructions below.
-
-field: {FIELD_EXTRACTION}
-
-problem: {PROBLEM_EXTRACTION}
-
-method: {METHOD_EXTRACTION}
-
-task: {TASK_EXTRACTION}
-
-innovation: {INNOVATION_EXTRACTION}
+COMBINED_METADATA_PROMPT = f"""从气候建模或地球系统科学论文抽取高层元数据，按以下要求填充响应结构的所有字段。
+field：{FIELD_EXTRACTION}
+problem：{PROBLEM_EXTRACTION}
+method：{METHOD_EXTRACTION}
+task：{TASK_EXTRACTION}
+innovation：{INNOVATION_EXTRACTION}
 """
 
 # model + paper_screening are kept together (screening is gated by model) and run
 # on the heavier extraction_model for accuracy.
-MODEL_SCREENING_PROMPT = f"""You are analyzing a scientific paper related to climate modeling or Earth system science. Populate every field of the response schema using the instructions below.
-
-model: {MODEL_EXTRACTION} Return the model name(s) as a list of strings; if nothing is proposed, return ["no"].
-
-paper_screening: {PAPER_SCREENING_PROMPT}
+MODEL_SCREENING_PROMPT = f"""分析气候建模或地球系统科学论文，按以下要求填充响应结构的所有字段。
+model：{MODEL_EXTRACTION} 模型名称以字符串列表返回；没有时返回 ["no"]。
+paper_screening：{PAPER_SCREENING_PROMPT}
 """
 
 

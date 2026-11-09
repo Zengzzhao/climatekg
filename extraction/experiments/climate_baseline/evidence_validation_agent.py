@@ -15,6 +15,11 @@ import argparse
 import datetime as dt
 import json
 from pathlib import Path
+import sys
+
+EXTRACTION_ROOT = Path(__file__).resolve().parents[2]
+if str(EXTRACTION_ROOT) not in sys.path:
+    sys.path.insert(0, str(EXTRACTION_ROOT))
 from typing import Iterable
 
 from rapidfuzz import fuzz
@@ -22,7 +27,7 @@ from evidence_schema import verify_units
 from tqdm import tqdm
 
 
-SCRIPT_DIR = Path(__file__).resolve().parent
+SCRIPT_DIR = Path(__file__).resolve().parents[2]
 DEFAULT_THRESHOLD = 80.0
 
 

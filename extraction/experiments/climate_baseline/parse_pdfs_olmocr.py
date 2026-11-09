@@ -17,7 +17,7 @@ import sys
 from pathlib import Path
 
 
-SCRIPT_DIR = Path(__file__).resolve().parent
+SCRIPT_DIR = Path(__file__).resolve().parents[2]
 DEFAULT_OLMOCR_DIR = Path.home() / "olmocr"
 
 

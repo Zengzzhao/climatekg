@@ -8,13 +8,18 @@ import json
 import os
 import re
 from pathlib import Path
+import sys
+
+EXTRACTION_ROOT = Path(__file__).resolve().parents[2]
+if str(EXTRACTION_ROOT) not in sys.path:
+    sys.path.insert(0, str(EXTRACTION_ROOT))
 from typing import Any
 
-from consts import EMBEDDING_MATCH_ENTITIES
+from experiments.climate_baseline.consts import EMBEDDING_MATCH_ENTITIES
 from tqdm import tqdm
 
 
-SCRIPT_DIR = Path(__file__).resolve().parent
+SCRIPT_DIR = Path(__file__).resolve().parents[2]
 DEFAULT_EMBEDDING_ROOT = SCRIPT_DIR / "embedding_files"
 DEFAULT_MODEL = "nvidia/NV-Embed-v2"
 STRICT_LABEL_RE = re.compile(r"^[A-Za-z_][A-Za-z0-9_]*$")

@@ -36,27 +36,26 @@ import numpy as np
 _EMB_LOCK = threading.RLock()
 _STATE_LOCK = threading.RLock()
 
-SCRIPT_DIR = Path(__file__).resolve().parent
+SCRIPT_DIR = Path(__file__).resolve().parents[2]
 REPO_ROOT = SCRIPT_DIR.parent
 if str(SCRIPT_DIR) not in sys.path:
     sys.path.insert(0, str(SCRIPT_DIR))
 
-from consts import (  # noqa: E402
+from experiments.climate_baseline.consts import (  # noqa: E402
     ALL_RELATIONSHIP_SOURCE_TO_TARGET,
     EMBEDDING_MATCH_ENTITIES,
     ENTITY_TYPES_TO_ADD_INSTANCES,
 )
-from prompts_deprecated import EMBEDDING_FALLBACK_LLM_PROMPT  # noqa: E402
+from experiments.climate_baseline.prompts_deprecated import EMBEDDING_FALLBACK_LLM_PROMPT  # noqa: E402
 
 
-SOURCE_COMPONENT_MATCH_CONFIRMATION_PROMPT = """Given a SourceComponent extracted from a climate-modeling paper and an existing SourceComponent candidate from the knowledge graph, decide whether they refer to the same concrete model component, subsystem, or component version.
-
-Answer with only 'yes' or 'no'. Do not provide an explanation.
-
-Extracted SourceComponent: {extracted_instance}
-Existing SourceComponent candidate: {candidate_instance}
-Embedding similarity score: {score}
-Paragraph context: {paragraph}
+SOURCE_COMPONENT_MATCH_CONFIRMATION_PROMPT = """给定从气候建模论文抽取的 SourceComponent，以及知识图谱中已有的候选 SourceComponent，
+判断二者是否指同一个具体模型组件、子系统或组件版本。
+只回答 yes 或 no，不解释。
+抽取的组件：{extracted_instance}
+已有候选组件：{candidate_instance}
+向量相似度：{score}
+段落上下文：{paragraph}
 """
 
 SOURCE_EMBEDDING_BELOW_THRESHOLD = "SOURCE_EMBEDDING_BELOW_THRESHOLD"

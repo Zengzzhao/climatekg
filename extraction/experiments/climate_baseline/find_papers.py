@@ -29,7 +29,7 @@ from tqdm import tqdm
 
 
 # Load env (GOOGLE_API_KEY, etc.)
-load_dotenv()  # also check cwd / parent dirs
+load_dotenv(Path(__file__).resolve().parents[2] / ".env")  # also check cwd / parent dirs
 
 # ── Neo4j ──────────────────────────────────────────────────────────────────
 NEO4J_URI = os.getenv("NEO4J_URI", "neo4j://localhost:8687")
@@ -47,13 +47,10 @@ MAX_PDF_DOWNLOAD_BYTES = 100 * 1024 * 1024
 PDF_CHUNK_SIZE = 8192
 PDF_TIMEOUT = 30
 
-RELEVANCE_PROMPT = (
-    "Based on the title and abstract of the paper, analyze whether the paper "
-    "likely contains climate model simulation data or results. "
-    'Answer with a simple "yes" or "no".\n'
-    "Title: {title}\n"
-    "Abstract: {abstract}"
-)
+RELEVANCE_PROMPT = """根据论文标题和摘要，判断论文是否可能包含气候模型模拟数据或结果。
+只回答 yes 或 no。
+标题：{title}
+摘要：{abstract}"""
 
 
 # ── Neo4j helpers ──────────────────────────────────────────────────────────
@@ -331,7 +328,7 @@ def check_relevance(llm: Ollama, title: str, abstract: str) -> bool:
 
 def find_candidate_papers():
     today = datetime.datetime.now().strftime("%Y-%m-%d")
-    script_dir = Path(__file__).resolve().parent
+    script_dir = Path(__file__).resolve().parents[2]
     meta_dir = script_dir / "papers" / "metadata"
     meta_dir.mkdir(parents=True, exist_ok=True)
     out_path = meta_dir / f"candidate_papers_{today}.json"

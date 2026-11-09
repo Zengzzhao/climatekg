@@ -16,9 +16,13 @@ def reading_form(text):
 
 
 def entity_match(name, text):
-    name = reading_form(name)
+    # Math names often cross a LaTeX boundary: "$x_d$ (FN)-index".
+    # Whitespace around name punctuation is typography, not a distinct variant.
+    def match_form(value):
+        return re.sub(r'\s*([()_^])\s*',r'\1',reading_form(value))
+    name = match_form(name)
     variants = [name] + ([name[:-6]] if name.endswith('-index') else [])
-    return any(re.search(r'(?<!\w)' + re.escape(v) + r'(?![\w(])', reading_form(text)) for v in variants if v)
+    return any(re.search(r'(?<!\w)' + re.escape(v) + r'(?![\w(])', match_form(text)) for v in variants if v)
 
 
 def tokens(text):

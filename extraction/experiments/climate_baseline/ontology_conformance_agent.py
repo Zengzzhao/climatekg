@@ -10,12 +10,17 @@ import datetime as dt
 import json
 import re
 from pathlib import Path
+import sys
+
+EXTRACTION_ROOT = Path(__file__).resolve().parents[2]
+if str(EXTRACTION_ROOT) not in sys.path:
+    sys.path.insert(0, str(EXTRACTION_ROOT))
 from typing import Iterable
 
-from consts import FILTERED_RELATIONSHIP_SOURCE_TO_TARGET
+from experiments.climate_baseline.consts import FILTERED_RELATIONSHIP_SOURCE_TO_TARGET
 
 
-SCRIPT_DIR = Path(__file__).resolve().parent
+SCRIPT_DIR = Path(__file__).resolve().parents[2]
 ONTOLOGY_CONFORMANCE_KEY = "ontology_conformed"
 LEGACY_ONTOLOGY_CONFORMANCE_KEY = "ontology conformed"
 
