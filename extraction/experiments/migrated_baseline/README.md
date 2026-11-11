@@ -28,8 +28,7 @@ flowchart TD
     A --> E[实体请求]
     A --> R[关系与证据请求：paragraph字符串]
     M -- 论文身份 --> R
-    R --> F[旧紧邻公式补全：默认开启]
-    F --> O[旧本体检查：含初始互斥]
+    R --> O[旧本体检查：含初始互斥]
     E -- 事后端点检查 --> O
     O --> P[旧模糊证据核验]
     P --> V[旧Validator：直接接收字符串]
@@ -81,7 +80,7 @@ flowchart TD
   --output reports/migrated_baseline_strict_2026-11-05/paper_001_run1
 ```
 
-支持旧入口的model、validator-model、evaluator-model、base-url、thinking、max-tokens、threshold、date、paper-id配置；默认值遵循旧入口。紧邻公式补全默认开启，显式指定 `--no-local-formula-completion` 才关闭。目录不覆盖保护保留，不提供force覆盖历史实验。
+支持旧入口的 model、validator-model、evaluator-model、base-url、thinking、max-tokens、threshold、date、paper-id 配置，默认值遵循旧入口。旧流程对照使用 `LEGACY_KG_LINKING_PROMPT`，关系证据取同一自然段内能独立支撑关系的最短连续原文，独立公式或表格限一个公式块或一行。启动器关闭旧紧邻公式补全，历史命令中的 `--no-local-formula-completion` 仍可传入。每次实验使用新输出目录。
 
 ## 输出及旧结果解释
 

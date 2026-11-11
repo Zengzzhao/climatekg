@@ -34,7 +34,7 @@ def frozen_source(name):
 
 
 def prompt_adapter():
-    """仅提示词适配：旧详情使用字符串，Validator使用旧流程专用模板。"""
+    """仅提示词适配：旧抽取与Validator使用专用模板，详情使用字符串。"""
     module = types.ModuleType('prompts_zh')
     for name, value in vars(current_prompts).items():
         if not name.startswith('__'):
@@ -42,6 +42,7 @@ def prompt_adapter():
     module.INDICATOR_DETAILS_PROMPT = (
         current_prompts.INDICATOR_DETAILS_PROMPT + '\nevidence 是一个连续原文字符串。\n'
     )
+    module.KG_LINKING_PROMPT = current_prompts.LEGACY_KG_LINKING_PROMPT
     module.VALIDATION_PROMPT = current_prompts.LEGACY_VALIDATION_PROMPT
     return module
 
@@ -92,7 +93,9 @@ def main():
     parser.add_argument('--threshold', type=float, default=80.0)
     parser.add_argument('--max-tokens', type=int, default=16384)
     parser.add_argument('--thinking', choices=('disabled','enabled'), default='disabled')
-    parser.add_argument('--no-local-formula-completion', action='store_true')
+    # 接受历史命令中的开关。短证据模式始终关闭跨块公式补全。
+    parser.add_argument('--no-local-formula-completion', action='store_true',
+                        default=True, help=argparse.SUPPRESS)
     args = parser.parse_args()
     sources = {name: frozen_source(name) for name in MODULES}
     hashes = {name: hashlib.sha256(source).hexdigest() for name, source in sources.items()}
@@ -103,6 +106,7 @@ def main():
             print(json.dumps(dict(base_commit=BASE_COMMIT, mode='严格旧流程＋当前中文提示词',
                 frozen_modules=list(MODULES), source_sha256=hashes, api_calls=0,
                 relation_evidence_schema='paragraph字符串', detail_evidence_schema='字符串',
+                local_formula_completion=False,
                 evidence_array_wrapping=False, candidate_review=False, evidence_retrieval=False,
                 condition_role_selection=False, exclusivity='旧提交本体阶段检查，不使用验证后门控',
                 judge_evidence='旧调用方式，直接传paragraph字符串，不添加多片段模板'), ensure_ascii=False, indent=2))

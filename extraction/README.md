@@ -106,6 +106,12 @@ DEEPSEEK_MODEL=cuc/deepseek
 
 ## 新流程指定目录批量运行
 
+关系证据检索对照可运行 `experiments/relation_retrieval.py --help`。其中 `sweep`
+本地比较分片、检索与预算召回，`controls` 对比固定证据的 Validator 判定，
+`live` 复用现有角色标注、选证和逐字核验链路。向量实验读取本地 BGE 的 ONNX 和 tokenizer 文件，
+需要 `onnxruntime` 与 `tokenizers`。主入口的 `--experimental-evidence-bge <模型目录>`
+可启用 350 字符关系条件链配置，适用于 `improves_on` 与 `alternative_to`。
+
 ### 联合选证与定向补检（2026-11-05 更新）
 
 默认 `coherent` 选证由模型联合审阅检索池中的原文，不再使用角色覆盖增益／长度的贪心评分。
@@ -123,6 +129,7 @@ Validator 一次调用返回 `verdict`、`reason`、`missing_evidence`、`search
 只有选定的原文数组进入 Validator/Evaluator；拒绝理由、检索需求、角色说明均不作为证据。
 `evidence_completion.trace` 保存每轮判定、反馈、选择理由、检索词和补检单元；`supports` 仅包含最终保留单元的标注，
 `pool_supports` 保留完整池标注供审计。非法 JSON、未知单元、重复单元、超预算或截断响应是执行错误，不计为语义拒绝。
+每轮的 `retrieved_evidence`、`selection.evidence` 和补检记录的 `shortlist_evidence`、`selected_evidence` 分别内嵌对应片段的原文、章节及全文字符区间。顶层 `evidence` 记录最终实际送验的片段。
 这些改动改善证据组织及诊断，不保证候选被通过；反证和不足应继续被拒绝，Evaluator 保持独立。
 
 算法更新后请使用新的实验输出／批次目录。历史结果及 frozen 旧流程不会被重写；旧批次不能混入新算法续跑。

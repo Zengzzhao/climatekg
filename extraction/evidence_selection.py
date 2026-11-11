@@ -23,7 +23,12 @@ ROLES = {
     'limitation': '在给定任务下识别目标的具体缺陷、偏差或缺失的评价能力。',
     'repair': '来源在同一任务下明确解决目标的同一缺陷或能力缺口；明确的设计目标可以支持，抽取器猜测不行。',
     'substitutability': '在给定条件下，对同一评价目标明确可替代。',
-    'direct_input': '来源是目标直接聚合的具名定量分数；方向不可反转，不是传递输入或算法。',
+    'variant_membership': '具名候选属于被讨论的变体组。保留该组、原指标和评价任务的先行语境。',
+    'substitution_rule': '说明哪些指标或变体在什么条件下可以替代具名原指标。可使用该组的指代，不要求本段重复列出组内成员。',
+    'task_definition': '具名原指标的定义或引入陈述，明确说明该指标测量什么或用于什么评价任务。',
+    'mitigation_rationale': '明确说明某设计机制如何缓解具体局限，保留局限与机制的对应关系。',
+    'direct_input': '目标直接使用来源的具名定量结果。',
+    'input_step': '候选间接计算依赖链中的一跳，原文给出某个定量测度的结果如何被下一步使用。允许只出现该跳涉及的测度，须保留用于对齐中间量的公式、名称或符号。',
 }
 
 # 仅用于英文原文的稀疏检索，不作为模型提示词发送。
@@ -45,27 +50,35 @@ ROLE_SEARCH_TERMS = {
     'limitation': 'A specific defect, bias or missing evaluation capability of TARGET is identified under the stated task.',
     'repair': 'SOURCE explicitly addresses THAT defect or missing evaluation capability of TARGET under the same stated task; a stated design objective suffices, but speculation by the extractor does not.',
     'substitutability': 'Explicit substitutability for the same evaluation goal under stated conditions.',
-    'direct_input': 'SOURCE is a named quantitative score directly aggregated by TARGET, in this direction; not a transitive input or an algorithm.',
+    'direct_input': 'TARGET directly uses the named quantitative result of SOURCE.',
+    'input_step': 'Formula or calculation step using a defined quantitative result to compute an intermediate or final indicator in the dependency chain.',
 }
 PATHS = {
     'proposes':[['contribution']], 'modifies':[['change']], 'applies':[['actual_use']],
     'variant_of':[['variant_claim'],['lineage','retained_core','change']],
     'derived_from':[['derivation_claim','substantive_change'],['lineage','base_design','source_design','substantive_change']],
     'improves_on':[['improvement_claim'],['limitation','repair']],
-    'alternative_to':[['substitutability']], 'component_of':[['direct_input']],
+    'alternative_to':[['substitutability']], 'component_of':[['direct_input'],['input_step']],
 }
 
 
-def paths_for(candidate):
+def paths_for(candidate, *, decomposed=False, task_scoped=False):
     # Paper action roles already require current-study attribution; avoid a duplicate
     # separately annotated condition that can mechanically reject the same evidence.
     common = ['target_identity'] + (['source_identity'] if candidate['source_entity_type']=='Indicator' else [])
-    return [common+path for path in PATHS[candidate['relation']]]
+    paths = PATHS[candidate['relation']]
+    if decomposed and candidate['relation'] == 'alternative_to':
+        paths = paths + [['variant_membership','substitution_rule']]
+        if task_scoped:
+            paths = [['task_definition']+path for path in paths]
+    if decomposed and candidate['relation'] == 'improves_on':
+        paths = paths + [['limitation','mitigation_rationale','source_design']]
+    return [common+path for path in paths]
 
 
 def select_evidence(candidate, pool, supports, *, method='coherent', limit=6,
                     max_chars=14000, client=None, model=None, feedback=None,
-                    previous_ids=()):
+                    previous_ids=(), decomposed=False, task_scoped=False, explicit_variant_scopes=False):
     """Choose the bundle jointly; never seek a judge's favorable label.
 
     ``cover`` is a compatibility alias for the new selector, not the old greedy
@@ -80,7 +93,7 @@ def select_evidence(candidate, pool, supports, *, method='coherent', limit=6,
     for s in supports:
         if s['unit_id'] in roles:
             roles[s['unit_id']].add(s['role'])
-    paths = paths_for(candidate)
+    paths = paths_for(candidate, decomposed=decomposed, task_scoped=task_scoped)
     def covered(ids):
         return set().union(*(roles[i] for i in ids)) if ids else set()
     if method=='topk':
@@ -98,6 +111,21 @@ def select_evidence(candidate, pool, supports, *, method='coherent', limit=6,
 充分性只依据选中的原文，不能由角色数量、名称共现、未选片段或自己的解释补足；反馈是待核查问题。
 证据充分时 sufficient 为 true 且缺口为空，否则选最有信息的片段并写明缺口。只返回给定片段的 ID。
 只返回 JSON：{"ids":["e0001"],"sufficient":false,"explanation":"选择理由","missing_evidence":["具体缺口"]}。'''
+        if candidate['relation']=='component_of':
+            instruction += '\n间接组成须选择覆盖计算链每一跳的证据，按公式、名称或符号绑定前一步的结果和后一步的输入。仅有一个 input_step 标注不能证明整条链。'
+        if decomposed:
+            instruction += '''
+按任一完整路径组装证据。条件替代分别保留原指标与任务、具名变体的归属、以及可替代的原文条件。
+设计改进分别保留原指标的具体局限、缓解该局限的机制与具名变体采用该机制的构造。局限与应对必须指向同一问题。
+优先补齐缺少的路径条件，再选重复陈述。原样本没有满足条件的结果与一般替代条件应分开阅读，设计目的与实测效果也应分开阅读。
+'''
+        if task_scoped and candidate['relation']=='alternative_to':
+            instruction += '条件替代还须选出定义或引入具名原指标并明示其评价任务的片段。只在规则中提到原指标名称不覆盖该条件。'
+        if explicit_variant_scopes and candidate['relation']=='variant_of':
+            instruction += '''
+若变体差异在于统计范围或时间窗口，且池中有明确说明两端范围的原文，分别保留原指标和具名变体的范围说明。
+相邻其他指标的窗口只能通过原文明确的类比句桥接。若选用该类比，也要保留明确给出原指标窗口的片段。
+'''
         from prompts_zh import RELATION_DEFINITIONS
         payload=dict(candidate={k:candidate[k] for k in ('source_entity_instance','source_entity_type',
                      'relation','target_entity_instance','target_entity_type')},

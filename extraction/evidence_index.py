@@ -29,6 +29,18 @@ def tokens(text):
     return re.findall(r'\w+', reading_form(text))
 
 
+def compact_endpoint_match(name, text):
+    """Match typography such as 'PopularityScore' vs 'popularity score'."""
+    if entity_match(name,text):
+        return True
+    # Keep variant punctuation. Only ignore spaces and typographic separators.
+    key = re.sub(r'[\s_-]+','',reading_form(name))
+    if len(key) < 3:
+        return bool(re.search(r'(?<!\w)' + r'\s*'.join(map(re.escape,name)) + r'(?!\w)',text))
+    pattern = r'[\s_-]*'.join(map(re.escape,key))
+    return bool(re.search(r'(?<!\w)'+pattern+r'(?![\w(])',reading_form(text)))
+
+
 @dataclass(frozen=True)
 class EvidenceUnit:
     id: str

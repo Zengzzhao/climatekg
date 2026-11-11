@@ -18,6 +18,7 @@ import sys
 
 from dotenv import load_dotenv
 from openai import OpenAI
+from prompts_zh import COMPONENT_OF_DEFINITION
 
 
 SCRIPT_DIR = Path(__file__).resolve().parent
@@ -41,7 +42,7 @@ Indicator → Indicator
 - derived_from：来源直接承继目标，且有超出简单适配的实质构造变化；仅共用符号、原理、框架或改变评价层级、嵌套聚合不足。
 - improves_on：来源针对具名目标在同一任务下的具体局限或能力缺口，提供对应改进。明确设计论证即可，不要求数值提升或公式继承，须区分意图与实测。一般创新、不同任务、相关性或更高分数不足；类别批评须明确绑定具体目标，不能推广到全部成员。
 - alternative_to：原文明示在给定条件下可互相替代以完成同一评价任务；仅比较、相关性或更高数值不足。
-- component_of：来源是目标直接使用的具名定量输入，方向为输入→复合指标。如 Z=a*X+b*Y，则 X→Z、Y→Z。不推导传递组成；计算分数的方法不自动是组成指标。标准化或加权变体不自动是原指标的直接输入，须有明确聚合证据。
+""" + COMPONENT_OF_DEFINITION + """
 
 归属、条件和方向须有原文依据。各标签独立检查，包括已有继承关系时的 improves_on。
 

@@ -183,10 +183,14 @@ def main():
     parser.add_argument("--relation-evidence", action=argparse.BooleanOptionalAction, default=True,
                         help="Use joint model evidence selection (default); --no-relation-evidence uses Top-k ablation")
     parser.add_argument("--evidence-rounds", type=int, default=1, choices=(0, 1))
+    parser.add_argument("--experimental-evidence-bge", type=Path,
+                        help="Opt in to relation-chain-350 for improves_on and alternative_to using local BGE files")
     parser.add_argument("--force", action="store_true")
     args = parser.parse_args()
     if args.max_tokens <= 0:
         parser.error("max-tokens must be positive")
+    if args.experimental_evidence_bge and not args.relation_evidence:
+        parser.error("Experimental evidence retrieval requires joint evidence selection")
     if Path(args.date).name != args.date or args.date in (".", ".."):
         parser.error("date must be a single directory name")
     paper_id = args.paper_id or args.markdown.stem
@@ -217,7 +221,8 @@ def main():
     print(f"关系证据检索与验证：model={validator_model}", flush=True)
     with OpenAI(api_key=api_key, base_url=base_url, timeout=180, max_retries=2) as client:
         total, valid = collect_data(data, markdown, client, validator_model,
-            method="coherent" if args.relation_evidence else "topk", max_rounds=args.evidence_rounds)
+            method="coherent" if args.relation_evidence else "topk", max_rounds=args.evidence_rounds,
+            experimental_bge=args.experimental_evidence_bge)
     verify_evidence(data, markdown)
     write_json(paths[2], data)
     write_json(paths[3], data)

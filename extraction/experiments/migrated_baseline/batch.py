@@ -131,7 +131,8 @@ def main():
     parser.add_argument('--threshold',type=float,default=80)
     parser.add_argument('--max-tokens',type=int,default=16384)
     parser.add_argument('--thinking',choices=('disabled','enabled'),default='disabled')
-    parser.add_argument('--no-local-formula-completion',action='store_true')
+    parser.add_argument('--no-local-formula-completion', action='store_true',
+                        default=True, help=argparse.SUPPRESS)
     args=parser.parse_args()
     root=args.input_root.expanduser().resolve();out=args.output.expanduser().resolve()
     if not root.is_dir():parser.error('input-root不是目录')
