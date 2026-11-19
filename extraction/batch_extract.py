@@ -10,10 +10,14 @@ from pathlib import Path
 import subprocess
 import sys
 from zoneinfo import ZoneInfo
-from dotenv import dotenv_values
+from dotenv import load_dotenv
 
 HERE=Path(__file__).resolve().parent
 ROOT=HERE.parent
+sys.path.insert(0,str(ROOT/'extraction'))
+from llm_backend import add_backend_argument, configure_backend
+from evidence_schema import EVIDENCE_MATCH_CONFIG
+
 SINGLE_ENTRY=HERE/'experiments/full_first_paper.py'
 
 
@@ -38,6 +42,27 @@ def scan(root):
 
 def read(path):
     return json.loads(path.read_text())
+
+
+def select_papers(papers, manifest_path):
+    """Use an explicit ordered subset, checking its saved source identities."""
+    manifest=read(manifest_path)
+    selected=manifest.get('papers') if isinstance(manifest,dict) else None
+    if not isinstance(selected,list) or not selected:
+        raise ValueError('paper-list必须包含非空papers数组')
+    available={p['paper_id']:p for p in papers}
+    result=[];seen=set()
+    for item in selected:
+        if not isinstance(item,dict):raise ValueError('paper-list的每篇论文必须是对象')
+        pid=item.get('paper_id')
+        if not isinstance(pid,str) or pid not in available:
+            raise ValueError(f'paper-list中的论文不在input-root中：{pid}')
+        if pid in seen:raise ValueError(f'paper-list重复论文：{pid}')
+        actual=available[pid]
+        if item.get('document_sha256')!=actual['document_sha256']:
+            raise ValueError(f'paper-list原文指纹不匹配：{actual["title"]}')
+        seen.add(pid);result.append(actual)
+    return result
 
 
 def save(path,data):
@@ -127,16 +152,30 @@ def main():
     scope=parser.add_mutually_exclusive_group()
     scope.add_argument('--limit',type=int,help='截断实验清单，仅选前N篇；需要单独输出目录，后续不能在原目录扩展')
     scope.add_argument('--stop-after',type=int,help='保留完整清单，本次仅处理按标题排序的前N篇（包括已完成项）；可在同目录增大N续跑')
+    scope.add_argument('--paper-list',type=Path,help='只运行JSON清单papers数组中的论文，按清单顺序，校验原文SHA256')
     parser.add_argument('--retry-failed',action='store_true',help='显式从头重试失败论文，保留原尝试目录；不重跑成功论文')
     parser.add_argument('--model')
     parser.add_argument('--workers',type=int,default=2,help='每篇内部验证／评估并发数；论文之间仍逐篇串行')
+    parser.add_argument('--extraction-thinking',choices=('enabled','disabled'),default='enabled')
+    parser.add_argument('--extraction-max-tokens',type=int,default=32768)
+    from compact_evidence import add_retrieval_arguments, bge_path
+    add_retrieval_arguments(parser)
+    parser.add_argument('--repair-attempts',type=int,default=0,
+                        help='Fresh attempts for malformed model output')
+    load_dotenv(ROOT/'extraction/.env')
+    add_backend_argument(parser)
+    parser.add_argument('--base-url')
     args=parser.parse_args()
     root=args.input_root.expanduser().resolve();out=args.output.expanduser().resolve()
     if not root.is_dir():parser.error('input-root不是目录')
     if args.limit is not None and args.limit<1:parser.error('limit必须为正数')
     if args.stop_after is not None and args.stop_after<1:parser.error('stop-after必须为正数')
-    if args.workers<1:parser.error('workers必须为正数')
+    if args.workers<1 or args.extraction_max_tokens<1:parser.error('workers及extraction-max-tokens必须为正数')
+    if args.repair_attempts<0:parser.error('repair-attempts必须非负')
     papers,missing=scan(root)
+    if args.paper_list:
+        try:papers=select_papers(papers,args.paper_list)
+        except (ValueError,OSError) as error:parser.error(str(error))
     if args.limit:papers=papers[:args.limit]
     if not papers:parser.error('没有找到论文子目录中的full.md')
     scheduled=papers[:args.stop_after] if args.stop_after is not None else papers
@@ -146,23 +185,36 @@ def main():
     if args.dry_run:
         print(json.dumps(dict(input_root=str(root),papers_manifest=len(papers),papers_planned=len(scheduled),
             stop_after=args.stop_after,missing_full_md=missing,
+            paper_list=str(args.paper_list) if args.paper_list else None,
             duplicate_document_groups=duplicate_groups,output=str(out),api_calls=0,
             execution='逐篇独立子进程，已完成项跳过；失败项仅在显式retry-failed时从头重试',
             examples=[dict(paper_id=p['paper_id'],title=p['title']) for p in scheduled[:3]]),ensure_ascii=False,indent=2))
         return
-    env=dotenv_values(HERE/'.env')
-    model=args.model or os.getenv('DEEPSEEK_MODEL') or env.get('DEEPSEEK_MODEL') or 'deepseek-chat'
-    endpoint=os.getenv('DEEPSEEK_BASE_URL') or env.get('DEEPSEEK_BASE_URL') or 'https://api.deepseek.com'
-    sources=[HERE/name for name in ['batch_extract.py','extract_md_deepseek.py','prompts_zh.py',
+    backend=configure_backend(args)
+    model=backend.model
+    endpoint=backend.base_url
+    sources=[HERE/name for name in ['llm_backend.py','batch_extract.py','extract_md_deepseek.py','prompts_zh.py',
         'evidence_index.py','evidence_selection.py','evidence_schema.py',
-        'relation_evidence.py','scientometrics_ontology.py','validation_agent.py','evaluation_agent.py',
+        'relation_evidence.py','scientometrics_ontology.py','validation_agent.py','evaluation_agent.py', 'evaluation_rubric.py',
         'triplet_metrics.py','experiments/full_first_paper.py']]
-    config=dict(workflow='new_condition_paths',input_root=str(root),model=model,
+    sources += [HERE/name for name in ('evidence_chunking.py','evidence_retrieval.py','compact_evidence.py')]
+    sources += [HERE/name for name in ('entity_names.py','extraction_policy.py','semantic_prompts.py','semantic_judgment.py','judgment_policy.py')]
+    config=dict(evidence_retrieval=args.evidence_retrieval,backend=backend.name,workflow='new_condition_paths',input_root=str(root),model=model,
         endpoint_sha256=digest(endpoint.encode()),workers=args.workers,
         selector='coherent',validator_feedback=True,targeted_expansion=True,
         pool_size=12,max_expansions=1,limit=6,max_chars=14000,
-        max_tokens=16384,thinking='disabled',
+        max_tokens=args.extraction_max_tokens,thinking=args.extraction_thinking,
+        evidence_matching=dict(EVIDENCE_MATCH_CONFIG),
         source_sha256={str(p.relative_to(ROOT)):digest(p.read_bytes()) for p in sources})
+    if args.evidence_retrieval=='compact':
+        from dataclasses import asdict
+        from evidence_retrieval import FrozenBGE
+        from compact_evidence import BEST_FIRST_POOL_CONFIG, BEST_FIRST_POOL_PACK
+        # Validate checkpoint identity before starting any paid request.
+        FrozenBGE(bge_path(args.compact_bge))
+        config.update(compact_retrieval=dict(config=asdict(BEST_FIRST_POOL_CONFIG),
+                      pack=BEST_FIRST_POOL_PACK,model=FrozenBGE.model,revision=FrozenBGE.revision),
+                      repair_attempts=args.repair_attempts)
     manifest=dict(config=config,papers=papers,missing_full_md=missing,duplicate_document_groups=duplicate_groups,
                   run_date=datetime.now(ZoneInfo('Asia/Shanghai')).date().isoformat())
     if out.exists() and not (out/'manifest.json').exists():parser.error('输出目录已存在但不是本批量入口目录，请换新目录')
@@ -214,7 +266,14 @@ def main():
             directory.mkdir(parents=True,exist_ok=True)
             attempt=directory/f'attempt_{len(attempts)+1:03d}'
             command=[sys.executable,str(SINGLE_ENTRY),'--markdown',paper['document_path'],
-                '--output',str(attempt),'--workers',str(args.workers)]
+                '--output',str(attempt),'--workers',str(args.workers),
+                '--backend',backend.name,'--model',model,'--base-url',endpoint,
+                '--evidence-retrieval',args.evidence_retrieval,
+                '--extraction-thinking',args.extraction_thinking,
+                '--extraction-max-tokens',str(args.extraction_max_tokens)]
+            if args.evidence_retrieval=='compact':
+                command += ['--compact-bge',str(bge_path(args.compact_bge).resolve()),
+                            '--repair-attempts',str(args.repair_attempts)]
             log=directory/f'{attempt.name}.log'
             print(f"[{i}/{len(scheduled)}] 开始：{paper['title']}；日志：{log}",flush=True)
             # 先登记尝试，意外中断也不会在下次启动时无提示地重复付费。

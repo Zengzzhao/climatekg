@@ -116,7 +116,6 @@ python3 data_get/verify_mineru_output.py --year 2024 --report data_get/mineru_20
 - 失败：0；未完成：0；额外 Markdown：0。
 - Markdown 均为非空 UTF-8，图片引用检查通过，共 2948 处。
 - 转换完成后，291 个源文件与保存任务的指纹一致。
-- 详细逐篇记录：[mineru_2024_verification.json](mineru_2024_verification.json)。
 
 运行中遇到服务端长时间排队，已补充 `--watch` 轮询批次的能力，并通过 8 项离线回归测试。
 可按以下命令持续执行其他年份或全量数据：
@@ -134,7 +133,6 @@ bash data_get/run_mineru.sh --batch-size 50 --max-wait 20 --watch
 保留原始 PDF 和精准 `vlm` 模型，分别重新提交后两篇均成功。
 
 最终 2023 年核验：323 个 PDF 对应 323 个有效 Markdown，0 失败、0 遗漏，2895 处图片引用检查通过。
-报告：[mineru_2023_verification.json](mineru_2023_verification.json)；
-原失败任务、文件检查和恢复结果：[mineru_2023_retry_diagnosis.json](mineru_2023_retry_diagnosis.json)。
+可用上面的核验命令重新生成逐篇报告，将 `--year` 和报告文件名改为 2023。
 
 脚本已补充临时解析失败的自动重试上限与失败历史保存；11 项离线回归测试通过。

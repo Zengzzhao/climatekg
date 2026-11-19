@@ -9,6 +9,8 @@ llama-index-llms-ollama==0.5.0
 neo4j==5.27.0
 pandas==2.2.3
 numpy==1.25.2
+onnxruntime==1.22.1               # local BGE first-pool retrieval
+tokenizers==0.20.3
 pydantic==2.12.4
 rapidfuzz==3.14.3
 requests==2.32.3
@@ -24,8 +26,6 @@ torch==2.6.0
 transformers==4.45.2
 sentence-transformers==2.7.0
 einops==0.8.0
-datasets==2.21.0
-pyarrow==18.1.0                    # scripts/build_hf_dataset.py
 
 # Optional: RDF export, ontology diagram, CORDEX domains, recall report
 rdflib==7.1.3

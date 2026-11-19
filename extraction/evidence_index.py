@@ -8,9 +8,10 @@ import re
 
 def reading_form(text):
     def normalize(m):
-        text = re.sub(r'\\(?:mathrm|mathbf|mathit|left|right|text|operatorname)\b', '', m.group())
+        text = re.sub(r'\\(?:mathrm|mathbf|mathit|pmb|left|right|text|operatorname)\b', '', m.group())
         return re.sub(r'[\s${}]', '', text)
-    text = re.sub(r'\$[^$]*\$|\\\([^\n]*?\\\)', normalize, text)
+    text = re.sub(r'\$\$[\s\S]*?\$\$|\$[^$\n]*\$|\\\([^\n]*?\\\)|\\\[[\s\S]*?\\\]', normalize, text)
+    text = text.replace(r'\_', '_')
     text = re.sub(r'([_^])\{([A-Za-z0-9]+)\}', r'\1\2', text)
     return text.translate(str.maketrans({'‐':'-', '‑':'-', '–':'-', '−':'-'})).lower()
 
@@ -56,20 +57,8 @@ class EvidenceIndex:
             raise ValueError('Empty source document')
         self.markdown = markdown
         self.sha256 = hashlib.sha256(markdown.encode()).hexdigest()
-        self.units = []
-        section = 'front matter'
-        for block in re.finditer(r'\S[\s\S]*?(?=\n[ \t]*\n|\Z)', markdown):
-            text = block.group()
-            heading = re.match(r'#{1,6}\s+([^\n]+)', text)
-            if heading:
-                section = heading[1]
-            if re.match(r'^(?:\d+[.\s]*)?(references|bibliography)\b', section, re.I):
-                continue
-            for offset in range(0, len(text), 2000):
-                start, end = block.start()+offset, min(block.end(), block.start()+offset+2600)
-                self.units.append(EvidenceUnit(f'e{len(self.units):04d}', start, end, section, markdown[start:end]))
-                if end == block.end():
-                    break
+        from evidence_chunking import chunk_units
+        self.units = chunk_units(markdown)
         self.by_id = {u.id:u for u in self.units}
         self.counts = {u.id:Counter(tokens(u.text)) for u in self.units}
         df = Counter(t for c in self.counts.values() for t in c)

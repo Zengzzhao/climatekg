@@ -1,29 +1,45 @@
-"""Sentence-aligned evidence chunks with exact Markdown coordinates."""
+"""Exact-source semantic units: complete sentences, bound formulas and whole tables."""
 import re
-
+import unicodedata
 from evidence_index import EvidenceUnit
 
-BLOCK = re.compile(r'\S[\s\S]*?(?=\n[ \t]*\n|\Z)')
-HEADING = re.compile(r'#{1,6}\s+([^\n]+)')
-REFERENCES = re.compile(r'^(?:\d+[.\s]*)?(references|bibliography)\b', re.I)
 MATH = re.compile(r'\$\$[\s\S]*?\$\$|\$[^$\n]*\$|\\\([\s\S]*?\\\)|\\\[[\s\S]*?\\\]')
-DISPLAY = re.compile(r'^(?:\$\$|\\\[)')
-TABLE_ROWS = re.compile(r'<tr\b[^>]*>[\s\S]*?</tr>', re.I)
-BLOCK_BREAK = re.compile(r'\n[ \t]*\n')
 ABBREVIATION = re.compile(r'(?:\b(?:al|figs?|eqs?|refs?|vol|vs|cf|dr|mr|ms|prof)|\b(?:[a-z]\.)+[a-z])\.$', re.I)
-ANAPHOR = re.compile(
-    r'^(?:this|these|those|such|it\b|they\b|the (?:former|latter)|'
-    r'further\b|that is\b|where\b|here\b|also\b|however\b|therefore\b)', re.I
+REFERENCES = re.compile(r'^(?:\d+[.\s]*)?(references|bibliography)\b', re.I)
+HEADING = re.compile(r'^#{1,6}\s+([^\n]+)')
+IMAGE = re.compile(r'!\[[^\]\n]*\]\((?:[^()\n]|\([^()\n]*\))*\)|<img\b[^>]*>', re.I)
+STRUCTURE = re.compile(
+    r'<table\b[^>]*>[\s\S]*?</table>'
+    r'|\$\$[\s\S]*?\$\$|\\\[[\s\S]*?\\\]'
+    r'|^[ \t]*\|[^\n]*\|[ \t]*\n[ \t]*\|?[ \t]*:?-{3,}[^\n]*\n(?:[ \t]*\|[^\n]*(?:\n|$))*'
+    r'|!\[[^\]\n]*\]\((?:[^()\n]|\([^()\n]*\))*\)|<img\b[^>]*>',
+    re.I | re.M,
 )
-
+LEAD_IN = re.compile(
+    r'(?:[:：]|(?:as follows|in the following way|given (?:by|as)|defined (?:by|as)|computed (?:by|as)|calculated (?:by|as)))\s*(?:\\\s*)?$', re.I)
+GLOSS = re.compile(r'^(?:where|here|with)\b', re.I)
+POLICY = dict(strategy='semantic', prose='complete_sentence',
+    formula='lead_in+display_formula+variable_gloss', table='whole',
+    fixed_character_cap=None, overlap=0, offsets='exact_source')
 
 def sentence_ranges(text):
     """Return trimmed offsets, treating math, common abbreviations and decimals atomically."""
     masked = MATH.sub(lambda m: '_' * len(m.group()), text)
+    # Closing parentheses can be inside inline math while the opener is prose.
+    # Pair against the original text, rather than the math-masked copy.
+    stack=[]
+    parenthetical=[False]*len(text)
+    for i,char in enumerate(text):
+        if char in '(（':stack.append((i,char))
+        elif char in ')）' and stack:
+            lo,opener=stack[-1]
+            if (opener,char) in {('(',')'),('（','）')}:
+                stack.pop()
+                parenthetical[lo:i+1]=[True]*(i+1-lo)
     boundaries = [0]
     for match in re.finditer(r'[.!?][\x22\x27”’)]*\s+(?=[A-Z0-9$\\])', masked):
         punctuation = match.start() + 1
-        if not ABBREVIATION.search(masked[:punctuation]):
+        if not parenthetical[match.start()] and not ABBREVIATION.search(masked[:punctuation]):
             boundaries.append(match.end())
     boundaries.append(len(text))
     return [
@@ -32,113 +48,81 @@ def sentence_ranges(text):
     ]
 
 
-def blocks(markdown):
-    section = 'front matter'
-    for block in BLOCK.finditer(markdown):
-        heading = HEADING.match(block.group())
-        if heading:
-            section = heading[1]
-        if not REFERENCES.match(section):
-            yield block, section
 
-
-def atoms(markdown, bind_formula=False, max_chars=500, split_tables=False):
-    """Keep display formulas whole. Bind adjacent setup and variable glosses when they fit."""
+def atoms(markdown):
+    """Return indivisible semantic spans, without character caps or sliding windows."""
     rows = []
-    for block, section in blocks(markdown):
-        text = block.group()
-        if split_tables and text.lower().startswith('<table'):
-            ranges = [row.span() for row in TABLE_ROWS.finditer(text)] or sentence_ranges(text)
-        else:
-            ranges = [(0, len(text.rstrip()))] if DISPLAY.match(text) else sentence_ranges(text)
-        rows.extend((block.start()+lo, block.start()+hi, section) for lo, hi in ranges)
-    if not bind_formula:
-        return rows
+    section = 'front matter'
+
+    def prose(start, end):
+        nonlocal section
+        for block in re.finditer(r'\S[\s\S]*?(?=\n[ \t]*(?:\\[ \t]*)?\n|\Z)', markdown[start:end]):
+            lo = start + block.start()
+            text = block.group()
+            heading = HEADING.match(text)
+            if heading:
+                body=unicodedata.normalize('NFKC',heading[1])
+                lhs,sep,rhs=body.partition('=')
+                formula_heading=(sep and re.fullmatch(r'[\w\s_^{}\\*-]{1,64}',lhs)
+                    and len(lhs.split())<=6 and re.search(r'[+*/∕÷×−]',rhs)
+                    and rows and rows[-1][2]==section
+                    and LEAD_IN.search(markdown[rows[-1][0]:rows[-1][1]])
+                    and not markdown[rows[-1][1]:lo].strip(' \t\r\n\\'))
+                if formula_heading:
+                    # Preserve the original heading markers and offsets; the
+                    # usual formula-binding pass joins this to its lead-in.
+                    end=lo+len(heading.group().rstrip())
+                    rows.append((lo,end,section,'formula'))
+                    tail=text.find('\n')
+                    if tail>=0:
+                        rows.extend((lo+tail+1+a,lo+tail+1+b,section,'sentence')
+                                    for a,b in sentence_ranges(text[tail+1:]))
+                    continue
+                section = heading[1]
+                # Heading is context metadata, not an evidence sentence.
+                tail = text.find('\n')
+                if tail < 0:
+                    continue
+                lo += tail + 1
+                text = text[tail+1:]
+            if REFERENCES.match(section):
+                continue
+            rows.extend((lo+a, lo+b, section, 'sentence') for a,b in sentence_ranges(text))
+
+    cursor = 0
+    for match in STRUCTURE.finditer(markdown):
+        prose(cursor, match.start())
+        if IMAGE.fullmatch(match.group()):
+            # Image paths/alt text are not source evidence; following captions
+            # remain ordinary original text with unchanged character offsets.
+            cursor = match.end()
+            continue
+        if not REFERENCES.match(section):
+            kind = 'table' if match.group().lstrip().startswith(('<', '|')) else 'formula'
+            rows.append((match.start(), match.start()+len(match.group().rstrip()), section, kind))
+        cursor = match.end()
+    prose(cursor, len(markdown))
     packed = []
-    i = 0
-    while i < len(rows):
-        lo, hi, section = rows[i]
-        if DISPLAY.match(markdown[lo:hi]):
-            if packed and packed[-1][2] == section and hi - packed[-1][0] <= max_chars:
-                prev_lo, prev_hi, _ = packed[-1]
-                if markdown[prev_lo:prev_hi].endswith(':'):
-                    lo = packed.pop()[0]
-            if i+1 < len(rows):
-                next_lo, next_hi, next_section = rows[i+1]
-                if (next_section == section and next_hi-lo <= max_chars
-                        and re.match(r'^(?:where\b|here\b|with\b)', markdown[next_lo:next_hi], re.I)):
-                    hi = next_hi
-                    i += 1
-        packed.append((lo, hi, section))
-        i += 1
-    return packed
+    for lo, hi, section, kind in rows:
+        if kind == 'formula' and packed:
+            a,b,s,k = packed[-1]
+            if s == section and k in {'sentence','formula'} and not markdown[b:lo].strip(' \t\r\n\\'):
+                if k == 'formula' or LEAD_IN.search(markdown[a:b]):
+                    packed.pop()
+                    lo = a
+        elif kind == 'sentence' and packed and GLOSS.match(markdown[lo:hi]):
+            a,b,s,k = packed[-1]
+            if k == 'formula' and s == section and not markdown[b:lo].strip(' \t\r\n\\'):
+                packed.pop()
+                lo,kind = a,'formula'
+        packed.append((lo,hi,section,kind))
+    return [(lo,hi,section) for lo,hi,section,_ in packed]
 
 
-def bounded_ranges(text, lo, hi, max_chars):
-    """Split oversize prose at a clause or word boundary outside inline math."""
-    if hi-lo <= max_chars or DISPLAY.match(text[lo:hi]):
-        yield lo, hi
-        return
-    masked = MATH.sub(lambda m: '_'*len(m.group()), text[lo:hi])
-    boundaries = [(lo+m.start(), lo+m.end()) for m in re.finditer(r'\s+', masked)]
-    clauses = {a for a,_ in boundaries if a>lo and text[a-1] in ',;:'}
-    while hi-lo > max_chars:
-        options = [(a,b) for a,b in boundaries if lo < a <= lo+max_chars]
-        if not options:
-            # A formula or token longer than the cap remains an indivisible atom.
-            options = [(a,b) for a,b in boundaries if a>lo][:1]
-        if not options:
-            break
-        end, start = next(((a,b) for a,b in reversed(options) if a in clauses and a>=lo+max_chars*.5),
-                          options[-1])
-        yield lo,end
-        lo = start
-    if lo < hi:
-        yield lo,hi
-
-
-def chunk_units(markdown, strategy, max_chars, max_sentences):
-    if strategy not in {'char', 'sentence', 'window', 'context', 'bounded'}:
-        raise ValueError(f'Unknown chunk strategy {strategy}')
-    if max_chars < 1 or max_sentences < 1:
-        raise ValueError('Chunk budgets must be positive')
-    if strategy == 'char':
-        step = max(1, 4*max_chars//5)
-        ranges = []
-        for block, section in blocks(markdown):
-            for lo in range(block.start(), block.end(), step):
-                hi = min(lo+max_chars, block.end())
-                ranges.append((lo, hi, section))
-                if hi == block.end():
-                    break
-    else:
-        contextual = strategy in {'context','bounded'}
-        spans = atoms(markdown, bind_formula=contextual, max_chars=max_chars,
-                      split_tables=strategy == 'bounded')
-        if strategy == 'bounded':
-            spans = [(a,b,section) for lo,hi,section in spans
-                     for a,b in bounded_ranges(markdown,lo,hi,max_chars)]
-        ranges = []
-        i = 0
-        while i < len(spans):
-            lo, hi, section = spans[i]
-            if contextual and i and ANAPHOR.match(markdown[lo:hi]):
-                prev_lo, prev_hi, prev_section = spans[i-1]
-                if prev_section == section and not BLOCK_BREAK.search(markdown[prev_hi:lo]) and hi-prev_lo <= max_chars:
-                    lo = prev_lo
-            j = i + 1
-            consumed = 2 if lo < spans[i][0] else 1
-            while j < len(spans) and consumed < max_sentences:
-                next_lo, next_hi, next_section = spans[j]
-                if (next_section != section or next_hi-lo > max_chars
-                        or BLOCK_BREAK.search(markdown[hi:next_lo])):
-                    break
-                hi = next_hi
-                j += 1
-                consumed += 1
-            ranges.append((lo, hi, section))
-            i = j if strategy == 'sentence' else i+1
-    return [
-        EvidenceUnit(f'e{i:04d}', lo, hi, section, markdown[lo:hi])
-        for i, (lo, hi, section) in enumerate(sorted(set(ranges))) if markdown[lo:hi].strip()
-    ]
+def chunk_units(markdown, strategy='semantic', max_chars=None, max_sentences=None):
+    # Budget arguments remain accepted for callers' configuration schema; they
+    # never split a semantic unit. Old chunk strategies have been removed.
+    if strategy != 'semantic':
+        raise ValueError(f'Old chunk strategy {strategy!r} has been removed; use semantic')
+    return [EvidenceUnit(f'e{lo}-{hi}',lo,hi,section,markdown[lo:hi])
+            for lo,hi,section in atoms(markdown)]

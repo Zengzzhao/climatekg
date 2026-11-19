@@ -47,12 +47,29 @@ PROOF_FACETS = {
         ('variant', 'The named variant is defined with a modified, shorter or longer measurement time period, window, scope or weighting.', 'source'),
     ),
 }
+
+PROOF_FACETS_V2 = dict(PROOF_FACETS, **{
+    'proposes': (
+        ('attribution','This work proposes a new indicator. In this paper we develop, introduce or construct named measures as our contribution.',None),
+        ('binding','The named indicator is introduced by the current work, or is a member of the variants introduced after that original measure. Resolve the preceding author attribution.', 'target'),
+    ),
+    'applies': (
+        ('execution','In this study we computed, calculated, demonstrated or applied a named indicator on the dataset.', 'target'),
+        ('demonstration','Demonstration of computation of the named indicator. To demonstrate the framework we collected publication data for the institutions in the case study.', 'target'),
+        ('result','The named indicator has a reported numerical value, computed rank correlation, or demonstrated calculation for the studied institutions or country.', 'target'),
+    ),
+    'variant_of': (
+        ('membership','The original named indicator is proposed in this work. Two named variants of this indicator are introduced. Resolve the antecedent of this indicator.', 'target'),
+        ('variant','A named indicator is a member of these variants or adaptations of the original indicator.', 'source'),
+    ),
+})
 STOP = set('a an and any are as at be been both but by can for from had has have how if in into is it its may more of on one or other our same so than that the their then these they this those through to used using was were what when where which who will with would'.split())
 
 
 def retrieval_query(candidate):
     roles = sorted({q for path in paths_for(candidate) for q in path})
-    return ' '.join(roles) + ' ' + ' '.join(ROLE_SEARCH_TERMS[q] for q in roles)
+    aliases = [a for side in ('source','target') for a in candidate.get(side+'_entity_aliases', [])]
+    return ' '.join(roles) + ' ' + ' '.join(ROLE_SEARCH_TERMS[q] for q in roles) + (' ' + ' '.join(aliases) if aliases else '')
 
 
 def endpoint_names(candidate):
@@ -67,7 +84,7 @@ def search_tokens(text):
 @dataclass(frozen=True)
 class RetrievalConfig:
     method: str = 'sparse'
-    strategy: str = 'legacy'
+    strategy: str = 'semantic'
     chars: int = 2600
     sentences: int = 3
     mention: float = 2.
@@ -87,6 +104,15 @@ class RetrievalConfig:
     endpoint_weight: float = 0.
     neighbor_weight: float = 0.
     math_weight: float = 0.
+    attribution_weight: float = 0.
+    context_weight: float = 0.
+    causal_weight: float = 0.
+    result_weight: float = 0.
+    relation_weight: float = 0.
+    pool_order_weight: float = 0.
+    pool_structure: str = 'chains'
+    beam_policy: str = 'score'
+    score_fusion: str = 'early_linear'
 
 
 RELATION_CHAIN_350 = RetrievalConfig(method='chains', strategy='bounded', chars=350, sentences=2,
@@ -221,12 +247,7 @@ class RetrievalIndex(EvidenceIndex):
         cfg = self.config
         source, target = endpoint_names(candidate)
         relation = candidate['relation']
-        facets = PROOF_FACETS.get(relation) if cfg.role_profile=='proof' else None
-        facets = facets or RELATION_FACETS.get(relation)
-        if facets is None:
-            roles = dict.fromkeys(q for path in paths_for(candidate) for q in path)
-            facets = [(q, ROLE_SEARCH_TERMS[q], q.split('_')[0] if q.endswith('_identity') else None)
-                      for q in roles]
+        facets = self.facets_for(candidate)
         facet_labels = [f[0] for f in facets]
         keys = [source, target]
         lexical_scores = []
@@ -238,7 +259,7 @@ class RetrievalIndex(EvidenceIndex):
                 self._sentences = [[u.text[a:b] for a,b in sentence_ranges(u.text)] for u in self.units]
             flat = [s for unit in self._sentences for s in unit]
             boundaries = np.cumsum([len(s) for s in self._sentences])[:-1]
-            dense_queries = [text + (' Indicator: ' + keys[{'source':0, 'target':1}[side]] if side else '')
+            dense_queries = [text + (' Indicators: '+source+' and '+target if side=='both' else (' Indicator: ' + keys[{'source':0, 'target':1}[side]] if side else ''))
                              for _, text, side in facets]
             similarity = cosine_matrix(self.embedder.encode(dense_queries, query=True), self.embedder.encode(flat))
             pooled = []
@@ -246,14 +267,66 @@ class RetrievalIndex(EvidenceIndex):
                 attention = np.exp((group-group.max(axis=1, keepdims=True))/cfg.temperature)
                 pooled.append((attention*group).sum(axis=1)/attention.sum(axis=1))
             affinities = (1-cfg.dense)*affinities + cfg.dense*np.asarray([minmax(row) for row in np.asarray(pooled).T])
+        if cfg.relation_weight:
+            # A shared endpoint/relationship anchor complements, but never
+            # replaces, the distinct proof conditions. No gold text is used.
+            subject = source or 'The current paper'
+            query = f'{subject} {relation.replace("_", " ")} {target}.'
+            global_score = minmax(self.bm25(query,cfg.k1,cfg.b))
+            if cfg.dense:
+                sim = cosine_matrix(self.embedder.encode([query],query=True),self.embedder.encode(flat))[0]
+                values=[]
+                for group in np.split(sim,boundaries):
+                    attention=np.exp((group-group.max())/cfg.temperature)
+                    values.append(float((attention*group).sum()/attention.sum()))
+                global_score=(1-cfg.dense)*global_score+cfg.dense*minmax(np.asarray(values))
+            affinities=(1-cfg.relation_weight)*affinities+cfg.relation_weight*global_score[None,:]
+        if cfg.context_weight and relation=='improves_on' and source:
+            # Derive the query's design context from source-bound definitions in
+            # this document. No annotation, expected verdict or external text is used.
+            definitions=[]
+            for j,u in enumerate(self.units):
+                if not compact_endpoint_match(source,u.text):
+                    continue
+                cue=bool(re.search(r'\b(?:denoted|defined|called|given\s+by|computed\s+from)\b',u.text,re.I))
+                definitions.append((int(cue),-j,u))
+            picked=[]
+            for _,_,u in sorted(definitions,key=lambda v:v[:2],reverse=True):
+                if all(max(0,min(u.end,v.end)-max(u.start,v.start))/min(len(u.text),len(v.text))<.5 for v in picked):
+                    picked.append(u)
+                if len(picked)==2:
+                    break
+            if picked:
+                context=' '.join(u.text for u in picked)
+                conditional=minmax(self.bm25(context,cfg.k1,cfg.b))
+                if cfg.dense:
+                    similarity=cosine_matrix(self.embedder.encode([context],query=True),
+                        self.embedder.encode([u.text for u in self.units]))[0]
+                    conditional=(1-cfg.dense)*conditional+cfg.dense*minmax(similarity)
+                affinities=(1-cfg.context_weight)*affinities+cfg.context_weight*conditional[None,:]
+        if cfg.causal_weight and relation=='improves_on':
+            causal=[]
+            for u in self.units:
+                issue=bool(re.search(r'\b(?:bias\w*|limitation\w*|deficien\w*|drawback\w*|shortcoming\w*)\b',u.text,re.I))
+                repair=bool(re.search(r'\b(?:reduc\w*|mitigat\w*|eliminat\w*|correct\w*|resolv\w*|tackl\w*|address\w*)\b',u.text,re.I))
+                causal.append(float(issue and repair))
+            for i,label in enumerate(facet_labels):
+                if label=='rationale':
+                    affinities[i]=(1-cfg.causal_weight)*affinities[i]+cfg.causal_weight*np.asarray(causal)
+        if cfg.result_weight and relation=='applies':
+            observed=np.asarray([float(bool(re.search(r'<td[^>]*>[^<]*\b'+re.escape(target)+r'\b[^<]*</td>',u.text,re.I))
+                and bool(re.search(r'<td[^>]*>\s*-?\d',u.text,re.I))) for u in self.units])
+            for i,label in enumerate(facet_labels):
+                if label=='result':affinities[i]=(1-cfg.result_weight)*affinities[i]+cfg.result_weight*observed
         algebra = self.math_support(source,target) if cfg.math_weight else None
         for i, (_, _, endpoint) in enumerate(facets):
             if endpoint:
-                side = {'source':0, 'target':1}[endpoint]
-                bound = anchors[side]
+                side = {'source':0, 'target':1}.get(endpoint)
+                bound = np.minimum(anchors[0],anchors[1]) if endpoint=='both' else anchors[side]
                 if algebra is not None:
-                    affinities[i] = (1-cfg.math_weight)*affinities[i] + cfg.math_weight*algebra[side]
-                    bound = np.maximum(bound,algebra[side])
+                    math_score=np.minimum(algebra[0],algebra[1]) if endpoint=='both' else algebra[side]
+                    affinities[i] = (1-cfg.math_weight)*affinities[i] + cfg.math_weight*math_score
+                    bound = np.maximum(bound,math_score)
                 if cfg.endpoint_weight:
                     affinities[i] = (1-cfg.endpoint_weight)*affinities[i] + cfg.endpoint_weight*bound
                 affinities[i] = affinities[i] * (1-cfg.anchor+cfg.anchor*bound)
@@ -263,7 +336,29 @@ class RetrievalIndex(EvidenceIndex):
             nearby = np.exp(-np.abs(mid[:,None]-mid)/600) * (sections[:,None]==sections)
             context = np.max(affinities[:,None,:]*nearby,axis=2)
             affinities = (1-cfg.neighbor_weight)*affinities + cfg.neighbor_weight*context
+        if cfg.attribution_weight and relation in {'proposes','applies'}:
+            expression = (
+                r'\b(?:we\s+(?:propos\w*|develop\w*|introduc\w*|construct\w*)|'
+                r'(?:in\s+)?this\s+(?:work|paper|study)\b[\s\S]{0,180}?\b(?:propos\w*|develop\w*|introduc\w*|construct\w*|devis\w*))'
+                if relation=='proposes' else
+                r'\b(?:we\s+(?:comput\w*|calculat\w*|appl\w*|us\w*)|'
+                r'to\s+demonstrate\b|(?:index|indicator)\b[\s\S]{0,50}?\bvalue\b[\s\S]{0,50}?\d)'
+            )
+            authored = np.asarray([bool(re.search(expression,u.text,re.I)) for u in self.units])
+            affinities[0] = (1-cfg.attribution_weight)*affinities[0] + cfg.attribution_weight*authored
         return facet_labels, affinities
+
+    def facets_for(self,candidate):
+        template=PROOF_FACETS_V2 if self.config.role_profile=='proof_v2' else PROOF_FACETS
+        facets=template.get(candidate['relation']) if self.config.role_profile in {'proof','proof_v2'} else None
+        facets=facets or RELATION_FACETS.get(candidate['relation'])
+        if facets is None:
+            roles=dict.fromkeys(q for path in paths_for(candidate) for q in path)
+            facets=[(q,ROLE_SEARCH_TERMS[q],q.split('_')[0] if q.endswith('_identity') else None) for q in roles]
+        return facets
+
+    def endpoint_anchors(self,source,target,match):
+        return np.asarray([[bool(name) and match(name,u.text) for u in self.units] for name in (source,target)])
 
     def math_support(self,source,target):
         if self._math is None:
@@ -301,9 +396,8 @@ class RetrievalIndex(EvidenceIndex):
         source, target = endpoint_names(candidate)
         key = source, target, candidate['relation'], query, cfg
         if key not in self.features:
-            match = compact_endpoint_match if cfg.role_profile=='proof' else entity_match
-            anchors = np.asarray([[bool(name) and match(name,u.text) for u in self.units]
-                                  for name in (source, target)])
+            match = compact_endpoint_match if cfg.role_profile in {'proof','proof_v2'} or cfg.role_profile.startswith(('rule_','query_','context_')) else entity_match
+            anchors = self.endpoint_anchors(source,target,match)
             facets = ' '.join(f[1] for f in RELATION_FACETS.get(candidate['relation'], ()))
             if cfg.method == 'sparse':
                 terms = set(tokens(f'{source} {target} {facets if cfg.query_style == "facets" else query}'))
@@ -373,12 +467,33 @@ class RetrievalIndex(EvidenceIndex):
                         if last != i:
                             transition = cfg.edge*graph[last,i]-cfg.redundancy*overlap[last,i]
                     extensions.append((score+float(role[i])+transition, path+(i,)))
-            states = sorted(extensions,key=lambda s:(-s[0],s[1]))[:cfg.beam]
+            ordered=sorted(extensions,key=lambda s:(-s[0],s[1]))
+            if cfg.beam_policy=='score':
+                states=ordered[:cfg.beam]
+            else:
+                # Keep alternative witnesses alive without changing typed
+                # conditions, transition scores, or the beam-size budget.
+                if cfg.beam_policy not in {'terminal','prefix','endpoints'}:
+                    raise ValueError(f'Unknown beam policy {cfg.beam_policy}')
+                states=[];seen=set()
+                for item in ordered:
+                    path=item[1]
+                    key=(path[-1] if cfg.beam_policy=='terminal' else
+                         (path[:-1] or path) if cfg.beam_policy=='prefix' else
+                         (path[0],path[-1]))
+                    if key not in seen:
+                        states.append(item);seen.add(key)
+                    if len(states)==cfg.beam:break
+                if len(states)<cfg.beam:
+                    chosen={path for _,path in states}
+                    states.extend(item for item in ordered if item[1] not in chosen)
+                    states=states[:cfg.beam]
+                states=sorted(states,key=lambda s:(-s[0],s[1]))
         selected = []
         for score, path in states:
             for i in path:
                 if len(selected) == limit:
-                    return self.ranked_units(selected)
+                    return self.order_chain_pool(selected,base,affinity)
                 if available[i]:
                     selected.append((score/affinity.shape[0], i))
                     available[i] = False
@@ -387,6 +502,17 @@ class RetrievalIndex(EvidenceIndex):
                 break
             if available[i]:
                 selected.append((float(base[i]), int(i)))
+        return self.order_chain_pool(selected,base,affinity)
+
+    def order_chain_pool(self, selected, base, affinity):
+        """Refine witness order inside the same retrieved set, with stable ties."""
+        weight=self.config.pool_order_weight
+        if weight and len(selected)>1:
+            indices=[i for _,i in selected]
+            relevance=minmax(.5*base[indices]+.5*affinity[:,indices].mean(axis=0))
+            order=np.linspace(1.,0.,len(selected))
+            utility=(1-weight)*order+weight*relevance
+            selected=[selected[int(i)] for i in np.argsort(-utility,kind='stable')]
         return self.ranked_units(selected)
 
     def ranked_units(self, selected):

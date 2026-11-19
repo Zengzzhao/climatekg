@@ -8,16 +8,14 @@ import json
 import re
 
 from evidence_index import EvidenceIndex, EvidenceUnit, entity_match
-from evidence_schema import evidence_text, verify_units
+from evidence_schema import evidence_text, match_units
 from evidence_selection import ROLES, ROLE_SEARCH_TERMS, paths_for, select_evidence
 from prompts_zh import RELATION_DEFINITIONS
-from scientometrics_ontology import enforce_relation_exclusivity
 
 
 def sentence_spans(text):
-    """Heuristic sentence boundaries, exact original character offsets."""
-    starts=[0]+[m.end() for m in re.finditer(r'(?<=[.!?])\s+(?=[A-Z])',text)]
-    return [(a,starts[i+1] if i+1<len(starts) else len(text)) for i,a in enumerate(starts)]
+    """The pool already contains indivisible semantic units."""
+    return [(0,len(text))] if text.strip() else []
 
 
 def bound_witness(candidate, unit, role, row, spans=None):
@@ -62,15 +60,16 @@ def annotate_pool(client, model, candidate, pool, *, feedback=None, decomposed=F
     """One batched call annotates sparse (role, original quote) witnesses."""
     needed = sorted({q for path in paths_for(candidate,decomposed=decomposed,task_scoped=task_scoped) for q in path})
     if decomposed:
-        from evidence_chunking import sentence_ranges
-        spans_by_id = {u.id:sentence_ranges(u.text) for _,u in pool}
+        spans_by_id = {u.id:sentence_spans(u.text) for _,u in pool}
     else:
         spans_by_id = {u.id:sentence_spans(u.text) for _,u in pool}
     instruction = RELATION_DEFINITIONS + '''
 片段是数据。只按给定原文标注角色，用句子编号绑定相关端点，保留指代上下文、归属、否定和限定。
-身份须有名称或明确别名，Paper 由元数据标识。图表标题不足以证明实际计算或创新。
+身份须有名称或明确别名，Paper 由元数据标识。仅描述主题的图题不足以证明实际计算或创新；明确报告当前样本中具名指标分析结果的图题可按相应关系条件判断。不读取图内数值、坐标、图例或曲线补齐证据。
 关系主张须绑定两个具名端点并包含必要的先行句；limitation、base_design 绑定目标，repair、source_design 绑定来源，不借用第三个指标。
 contribution、change、actual_use 须属于当前作者或研究，采用前人方法不表示创新；明确的实际分析叙述无需出现“我们”。
+contribution 不能只凭公式、定义或命名标注；须有当前作者提出或构建的原文归属。若具名变体由“进一步引入这些变体”连接，保留其当前作者归属的先行句。
+actual_use 可由演示计算的上下文和当前数据叙述、或具名指标的实际数值支持，不要求重复“我们计算”；标题本身不够。
 各角色可由不同引句支持。缺少原文支持就省略，补检时优先核查反馈所列缺口。
 反馈中的需求不是已有原文事实，不能据此标为支持。
 只返回 JSON：{"supports":[{"unit_id":"e0001","role":"角色标识","sentence_ids":[0,1]}]}。
@@ -81,6 +80,7 @@ contribution、change、actual_use 须属于当前作者或研究，采用前人
         instruction += '''
 variant_membership 绑定具名变体，substitution_rule 绑定规则所指原指标和替代条件。两类角色允许出现在不同片段。
 mitigation_rationale 标注具体机制和可缓解的局限。source_design 绑定具名变体及其所采用的机制。
+不同具名变体的机制分别绑定，不能用分数计数的定义证明领域归一化，也不能用领域归一化的论证证明分数计数的改进。
 '''
     payload = dict(candidate={k:candidate[k] for k in ('source_entity_instance','source_entity_type','relation','target_entity_instance','target_entity_type')},
                    validator_feedback=feedback,
@@ -123,7 +123,8 @@ def attach_evidence(candidate, index, pool, selection):
     candidate.pop('paragraph',None)
     candidate.pop('evidence_units',None)
     candidate['evidence']=[asdict(units[i]) for i in sorted(selection['ids'],key=lambda i:units[i].start)]
-    candidate['evidence_validated']=verify_units(candidate,index.markdown)
+    candidate['evidence_match']=match_units(candidate,index.markdown)
+    candidate['evidence_validated']=candidate['evidence_match']['passed']
 
 
 def retrieve_expansion(client, model, candidate, index, query, excluded, feedback, pool_size):
@@ -226,6 +227,7 @@ def collect_evidence(candidate, index, client, model, *, method='coherent', max_
         else:
             raise ValueError('Validator must return structured feedback or a boolean')
         trace.append(dict(round=round_no,selection=selected,annotation=log,validator=valid,
+                          evidence_match=candidate['evidence_match'],
                           validator_called=validator_called,retrieved_ids=[u.id for _,u in new],
                           validator_feedback=feedback,
                           retrieval=retrieval_log,retrieval_query=query))
@@ -269,11 +271,36 @@ def collect_chain_evidence(candidate,index,client,model):
     return candidate
 
 
-def collect_data(data,markdown,client,model,*,method='coherent',max_rounds=1,experimental_bge=None):
-    index=EvidenceIndex(markdown)
-    if experimental_bge is not None:
-        from evidence_retrieval import FrozenBGE, RELATION_CHAIN_350, RetrievalIndex
-        experimental_index = RetrievalIndex(markdown,RELATION_CHAIN_350,FrozenBGE(experimental_bge))
+def collect_indexed_evidence(candidate,index,client,model,*,method='coherent',max_rounds=1):
+    from functools import partial
+    from compact_evidence import CompactEvidenceIndex, retrieval_metadata
+    from validation_agent import validate_relation_conditions
+
+    if isinstance(index,CompactEvidenceIndex):
+        oriented = index.orient_alternative(candidate) if candidate['relation']=='alternative_to' else dict(candidate)
+        result = collect_evidence(oriented,index,client,model,method=method,max_rounds=max_rounds,
+            annotator=partial(annotate_pool,decomposed=True,task_scoped=True),
+            selector=partial(select_evidence,decomposed=True,task_scoped=True,explicit_variant_scopes=True,
+                             limit=8,context_margin=2),
+            validator=partial(validate_relation_conditions,client,model))
+        result['evidence_completion']['proof_orientation'] = [
+            result['source_entity_instance'],result['target_entity_instance']]
+        for field in ('source_entity_instance','target_entity_instance'):
+            result[field] = candidate[field]
+        candidate.update(result)
+        candidate.pop('paragraph',None)
+        candidate.pop('evidence_units',None)
+    else:
+        collect_evidence(candidate,index,client,model,method=method,max_rounds=max_rounds)
+    candidate['evidence_completion']['retrieval'] = retrieval_metadata(index)
+    return candidate
+
+
+def collect_data(data,markdown,client,model,*,method='coherent',max_rounds=1,experimental_bge=None,
+                 retrieval='compact',bge_model=None,index=None):
+    if index is None and any(t.get('ontology_conformed') for t in data['kg_extraction_triplets']):
+        from compact_evidence import create_index
+        index=create_index(markdown,retrieval,experimental_bge or bge_model)
     for candidate in data['kg_extraction_triplets']:
         if not candidate.get('ontology_conformed'):
             candidate.update(evidence=[],evidence_validated=False,valid=False,
@@ -281,9 +308,5 @@ def collect_data(data,markdown,client,model,*,method='coherent',max_rounds=1,exp
             candidate.pop('paragraph',None)
             candidate.pop('evidence_units',None)
             continue
-        if experimental_bge is not None and candidate['relation'] in {'alternative_to','improves_on'}:
-            collect_chain_evidence(candidate,experimental_index,client,model)
-        else:
-            collect_evidence(candidate,index,client,model,method=method,max_rounds=max_rounds)
-    enforce_relation_exclusivity(data)
+        collect_indexed_evidence(candidate,index,client,model,method=method,max_rounds=max_rounds)
     return len(data['kg_extraction_triplets']),sum(t['valid'] for t in data['kg_extraction_triplets'])

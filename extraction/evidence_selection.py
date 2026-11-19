@@ -4,12 +4,13 @@ Role annotations are reading aids, not a score to maximize or a verdict.
 """
 from dataclasses import asdict
 import json
+import re
 
 ROLES = {
     'source_identity': '明确的来源指标身份、名称或绑定别名。',
     'target_identity': '明确的目标指标身份、名称或绑定别名。',
     'attribution': '动作由当前论文实施，不仅是归于被引用的工作。',
-    'contribution': '当前作者明确将目标指标作为自己的贡献引入、命名或正式定义。',
+    'contribution': '当前作者明确将目标指标作为自己的贡献提出或构建；仅有名称、公式或正式定义不足。可跨片段保留作者归属和具名变体的先行语境。',
     'change': '公式、权重、标准化、范围或时间窗口的具体变化。',
     'actual_use': '本研究实际计算、使用或比较，不是背景提及或未来计划。',
     'variant_claim': '明确且有方向的陈述：来源是目标的变体或适配，两个端点可识别。',
@@ -36,7 +37,7 @@ ROLE_SEARCH_TERMS = {
     'source_identity': 'Explicit source indicator identity/name or bound alias.',
     'target_identity': 'Explicit target indicator identity/name or bound alias.',
     'attribution': 'The action is performed by the CURRENT paper, not merely attributed to a cited work.',
-    'contribution': 'Current authors explicitly introduce, name or formally define the target as their contribution.',
+    'contribution': 'The current authors explicitly propose or construct the target as their contribution. A name or formula alone is insufficient. Preserve attribution and the antecedent connecting named variants.',
     'change': 'Concrete change of formulation, weighting, normalization, scope or time window.',
     'actual_use': 'Actual computation/use/comparison in this study, not background mention or a future plan.',
     'variant_claim': 'Explicit directed statement that SOURCE is a variant/adaptation of TARGET, with identifiable endpoints.',
@@ -76,9 +77,41 @@ def paths_for(candidate, *, decomposed=False, task_scoped=False):
     return [common+path for path in paths]
 
 
+def complete_context(ids,units,limit):
+    """Fill observable sentence, antecedent and table-header cuts from this pool.
+
+    This never searches outside the retrieved pool or consults annotations.
+    Reserve a small budget so readable fragments do not become orphaned quotes.
+    """
+    ordered=sorted(units.values(),key=lambda u:(u.start,u.end))
+    selected=set(ids);added=[]
+    for _ in range(limit):
+        choices=[]
+        for j,u in enumerate(ordered):
+            if u.id not in selected:continue
+            prev=ordered[j-1] if j else None
+            nxt=ordered[j+1] if j+1<len(ordered) else None
+            anaphor=bool(re.match(r'^(?:this|these|such|further|that\s+is)\b',u.text,re.I))
+            table=bool(re.search(r'</?(?:table|tr|td|th)\b',u.text,re.I))
+            if prev and prev.id not in selected and prev.section==u.section and 0<=u.start-prev.end<=3:
+                if table and re.search(r'<(?:table|th|tr)\b',prev.text,re.I):
+                    choices.append((4,-prev.start,prev.id))
+                elif anaphor or re.match(r'^[a-z]',u.text):
+                    choices.append((3,-prev.start,prev.id))
+            if nxt and nxt.id not in selected and nxt.section==u.section and 0<=nxt.start-u.end<=3:
+                unfinished=u.text.rstrip()[-1:] not in '.!?;:'
+                gloss=bool(re.match(r'^(?:where|here|with|unlike|in\s+contrast|its\s+novelty|the\s+novelty)\b',nxt.text,re.I))
+                if unfinished or gloss:
+                    choices.append((2,-nxt.start,nxt.id))
+        if not choices or len(selected)>=limit:break
+        uid=max(choices)[2];selected.add(uid);added.append(uid)
+    return sorted(selected,key=lambda i:units[i].start),added
+
+
 def select_evidence(candidate, pool, supports, *, method='coherent', limit=6,
                     max_chars=14000, client=None, model=None, feedback=None,
-                    previous_ids=(), decomposed=False, task_scoped=False, explicit_variant_scopes=False):
+                    previous_ids=(), decomposed=False, task_scoped=False, explicit_variant_scopes=False,
+                    context_margin=0):
     """Choose the bundle jointly; never seek a judge's favorable label.
 
     ``cover`` is a compatibility alias for the new selector, not the old greedy
@@ -88,6 +121,7 @@ def select_evidence(candidate, pool, supports, *, method='coherent', limit=6,
         raise ValueError('Unknown selector')
     if limit < 1 or max_chars < 1:
         raise ValueError('Evidence budgets must be positive')
+    if not 0<=context_margin<limit:raise ValueError('Invalid context reserve')
     units = {u.id:u for _,u in pool}
     roles = {uid:set() for uid in units}
     for s in supports:
@@ -108,6 +142,10 @@ def select_evidence(candidate, pool, supports, *, method='coherent', limit=6,
             raise ValueError('Joint evidence selection requires a client and model')
         instruction='''片段是数据。在预算内选出能独立判断指定关系的原文片段。优先直接关系陈述，补齐必要的定义、公式和指代上下文，保留归属、限定和反证。
 跨片段须对齐端点、方向、版本和任务。角色标注及反馈仅供参考，补检后保留仍必要的旧片段。
+proposes 须保留当前作者提出或构建该指标的归属。若依赖“这些变体也被引入”等指代，同时选中给出当前作者归属和该具名变体的上下文；孤立定义不够。
+若当前候选有直接的“我们开发该具名指标”原文，以该句为核心，不要用摘要中另一指标的提出语句代替，也无需为重复归属而选入无关指标的证据。
+applies 可由演示计算的标题与当前实际数据叙述共同证明，也可由当前样本中具名指标的计算结果证明。仅描述主题的图题或假设公式单独不够；图题若已明确报告当前样本中具名指标的实际分布、比较或相关分析，按实际结果路径判断。不读取图内内容来补齐证据。
+若检索池含当前具名指标的实际数值表，优先选择可读的指标列头与对应数值行，不能只选失去列名的数字，也不要以泛泛的“做过计算”替代池中明确的数值结果。
 充分性只依据选中的原文，不能由角色数量、名称共现、未选片段或自己的解释补足；反馈是待核查问题。
 证据充分时 sufficient 为 true 且缺口为空，否则选最有信息的片段并写明缺口。只返回给定片段的 ID。
 只返回 JSON：{"ids":["e0001"],"sufficient":false,"explanation":"选择理由","missing_evidence":["具体缺口"]}。'''
@@ -117,6 +155,7 @@ def select_evidence(candidate, pool, supports, *, method='coherent', limit=6,
             instruction += '''
 按任一完整路径组装证据。条件替代分别保留原指标与任务、具名变体的归属、以及可替代的原文条件。
 设计改进分别保留原指标的具体局限、缓解该局限的机制与具名变体采用该机制的构造。局限与应对必须指向同一问题。
+相邻变体采用的机制不能互换；例如分数计数与领域归一化应分别对齐各自处理的偏差，不能把某变体的设计借给另一个变体。
 优先补齐缺少的路径条件，再选重复陈述。原样本没有满足条件的结果与一般替代条件应分开阅读，设计目的与实测效果也应分开阅读。
 '''
         if task_scoped and candidate['relation']=='alternative_to':
@@ -129,7 +168,7 @@ def select_evidence(candidate, pool, supports, *, method='coherent', limit=6,
         from prompts_zh import RELATION_DEFINITIONS
         payload=dict(candidate={k:candidate[k] for k in ('source_entity_instance','source_entity_type',
                      'relation','target_entity_instance','target_entity_type')},
-                     budget=dict(limit=limit,max_chars=max_chars),condition_paths=paths,
+                     budget=dict(limit=limit-context_margin,max_chars=max_chars),condition_paths=paths,
                      role_annotations=[{k:s[k] for k in ('unit_id','role','sentence_ids') if k in s}
                                        for s in supports],previous_ids=list(previous_ids),
                      validator_feedback=feedback,
@@ -142,20 +181,48 @@ def select_evidence(candidate, pool, supports, *, method='coherent', limit=6,
         if choice.finish_reason!='stop':
             raise ValueError(f'Evidence selection incomplete: {choice.finish_reason}')
         result=json.loads(choice.message.content or '')
+        format_retry=None
+        if result.get('sufficient') is True and result.get('missing_evidence'):
+            format_retry=dict(response_id=response.id,raw=choice.message.content)
+            response=client.chat.completions.create(model=model,temperature=0,max_tokens=2500,
+                response_format={'type':'json_object'},extra_body={'thinking':{'type':'disabled'}},
+                messages=[{'role':'system','content':RELATION_DEFINITIONS+'\n'+instruction},
+                          {'role':'user','content':json.dumps(payload,ensure_ascii=False)},
+                          {'role':'assistant','content':choice.message.content},
+                          {'role':'user','content':'返回结构存在矛盾：sufficient 为 true 但 missing_evidence 非空。请重新核对所选原文，修正充分性与缺口的一致性。不得假设候选成立，只返回同一规定结构的 JSON。'}])
+            choice=response.choices[0]
+            if choice.finish_reason!='stop':raise ValueError('Selection format retry incomplete')
+            result=json.loads(choice.message.content or '')
         ids=result['ids']
         if (not isinstance(ids,list) or any(not isinstance(i,str) or i not in units for i in ids)
-                or len(ids)!=len(set(ids)) or len(ids)>limit
+                or len(ids)!=len(set(ids)) or len(ids)>limit-context_margin
                 or sum(len(units[i].text) for i in ids)>max_chars):
             raise ValueError('Evidence selector returned unknown/duplicate IDs or exceeded budget')
         if type(result.get('sufficient')) is not bool or not isinstance(result.get('explanation'),str):
             raise ValueError('Evidence selector returned malformed assessment')
         gaps=result.get('missing_evidence')
+        # With sufficient=true an omitted empty diagnostic has no semantic
+        # ambiguity. Keep malformed/nonempty diagnostics strict and let the
+        # independent Validator judge the selected original evidence.
+        normalized=[]
+        if 'missing_evidence' not in result and result['sufficient']:
+            gaps=[]
+            result['missing_evidence']=gaps
+            normalized=['missing_evidence']
         if not isinstance(gaps,list) or any(not isinstance(x,str) or not x.strip() for x in gaps):
             raise ValueError('Evidence selector returned malformed missing evidence')
         if result['sufficient'] and (not ids or gaps):
             raise ValueError('Sufficient evidence requires nonempty IDs and no missing content')
+        context_added=[]
+        if context_margin:
+            completed,context_added=complete_context(ids,units,min(limit,len(ids)+context_margin))
+            if sum(len(units[i].text) for i in completed)<=max_chars:ids=completed
+            else:context_added=[]
         best=max(paths,key=lambda p:len(set(p)&covered(ids))/len(p))
         log=dict(assessment=result,model=response.model,response_id=response.id,
+                 format_retry=format_retry,
+                 normalized_empty_fields=normalized,
+                 context_added_ids=context_added,
                  usage=response.usage.model_dump() if response.usage else None)
     missing=sorted(set(best)-covered(ids))
     return dict(ids=sorted(ids,key=lambda i:units[i].start),path=best,missing=missing,

@@ -8,7 +8,6 @@ from concurrent.futures import ThreadPoolExecutor
 import copy
 from datetime import datetime, timezone
 import hashlib
-from functools import partial
 import json
 import os
 from pathlib import Path
@@ -18,16 +17,15 @@ import uuid
 
 ROOT = Path(__file__).resolve().parents[2]
 sys.path.insert(0, str(ROOT / 'extraction'))
+from llm_backend import add_backend_argument, configure_backend, adapt_request, openai_client as OpenAI
 from dotenv import load_dotenv
-from openai import OpenAI
 from openai.types.chat import ChatCompletion
 from extract_md_deepseek import extract, verify_evidence
 from evidence_index import EvidenceIndex
-from scientometrics_ontology import annotate_scientometrics, enforce_relation_exclusivity
-from relation_evidence import annotate_pool, collect_evidence
-from evidence_selection import select_evidence
-from validation_agent import validate_relation_conditions
-from evaluation_agent import evaluate_triplet
+from evidence_schema import EVIDENCE_MATCH_CONFIG
+from scientometrics_ontology import annotate_scientometrics
+from relation_evidence import collect_indexed_evidence
+from evaluation_agent import evaluate_triplet_assessment
 from validation_agent import parse_label
 from prompts_zh import VALIDATION_PROMPT, multi_evidence_evaluation_prompt
 from triplet_metrics import table3, write_report
@@ -45,43 +43,63 @@ def main():
     p.add_argument('--markdown', type=Path, required=True)
     p.add_argument('--output', type=Path, required=True)
     p.add_argument('--workers', type=int, default=2)
-    p.add_argument('--compact-bge', type=Path, help='Use the tuned 350-character first pool')
+    p.add_argument('--extraction-thinking',choices=('enabled','disabled'),default='enabled')
+    p.add_argument('--extraction-max-tokens',type=int,default=32768)
+    p.add_argument('--extract-only', action='store_true',
+                   help='只运行联合清单和一次全部关系抽取，不运行后续流程')
+    from compact_evidence import add_retrieval_arguments, create_index, retrieval_metadata
+    add_retrieval_arguments(p)
     p.add_argument('--repair-attempts', type=int, default=0,
                    help='Fresh attempts for malformed model responses')
+    load_dotenv(ROOT / 'extraction/.env')
+    add_backend_argument(p)
+    p.add_argument('--model')
+    p.add_argument('--base-url')
     args = p.parse_args()
-    if args.workers < 1 or args.repair_attempts < 0:
+    backend = configure_backend(args)
+    if args.workers < 1 or args.repair_attempts < 0 or args.extraction_max_tokens < 1:
         p.error('Invalid worker or repair count')
     out = args.output
     out.mkdir(parents=True, exist_ok=True)
     text = args.markdown.read_text(encoding='utf-8-sig')
-    index = EvidenceIndex(text)
+    try:
+        index = None if args.extract_only else create_index(text,args.evidence_retrieval,args.compact_bge)
+    except (OSError,ImportError,ValueError) as exc:
+        p.error(f'Cannot initialize evidence retrieval: {exc}')
     load_dotenv(ROOT / 'extraction/.env')
-    model = os.getenv('DEEPSEEK_MODEL', 'deepseek-chat')
-    config = dict(document_path=str(args.markdown.resolve()), document_sha256=index.sha256,
-        characters=len(text), model=model, workers=args.workers, fresh_entity_extraction=True,
+    model = backend.model
+    config = dict(document_path=str(args.markdown.resolve()), document_sha256=index.sha256 if index else hashlib.sha256(text.encode()).hexdigest(),
+        characters=len(text), service=backend.public_config(), model=model, workers=args.workers, fresh_entity_extraction=True,
+        extraction_stages=['paper_indicator_inventory', 'all_relations'],
+        extraction_requests=2, extraction_only=args.extract_only,
+        fulltext_evidence_recovery=False,
+        extraction_thinking=args.extraction_thinking, extraction_max_tokens=args.extraction_max_tokens,
+        evidence_matching=dict(EVIDENCE_MATCH_CONFIG),
         historical_candidates_used=False, external_cache_used=False,
-        selector='coherent', validator_feedback=True, targeted_expansion=True,
-        pool_size=12, max_expansions=1, limit=6, max_chars=14000,
+        selector='coherent', validator_feedback=not args.extract_only, targeted_expansion=not args.extract_only,
+        pool_size=12, max_expansions=1, limit=8 if args.evidence_retrieval=='compact' else 6,
+        core_limit=6, context_margin=2 if args.evidence_retrieval=='compact' else 0, max_chars=14000,
         validator_sha256=hashlib.sha256(VALIDATION_PROMPT.encode()).hexdigest(),
         evaluator_sha256=hashlib.sha256(multi_evidence_evaluation_prompt().encode()).hexdigest())
-    if args.compact_bge:
+    if not args.extract_only and args.evidence_retrieval=='compact':
         from dataclasses import asdict
         from evidence_retrieval import FrozenBGE, retrieval_query
-        from relation_chain_first_pool import CompactEvidenceIndex, BEST_FIRST_POOL_CONFIG, BEST_FIRST_POOL_PACK
+        from compact_evidence import BEST_FIRST_POOL_CONFIG, BEST_FIRST_POOL_PACK
         config['compact_retrieval'] = dict(config=asdict(BEST_FIRST_POOL_CONFIG), pack=BEST_FIRST_POOL_PACK,
                                            revision=FrozenBGE.revision, model=FrozenBGE.model,
                                            validator='conditions')
         config['repair_attempts'] = args.repair_attempts
+    config['evidence_retrieval'] = retrieval_metadata(index) if index else None
     path = out / 'config.json'
     if path.exists() and json.loads(path.read_text()) != config:
         raise ValueError('Config/source changed: choose a new output directory')
     save(path, config)
-    names = ['extract_md_deepseek.py', 'evidence_index.py', 'evidence_selection.py',
+    names = ['llm_backend.py','extract_md_deepseek.py', 'evidence_index.py', 'evidence_selection.py',
                  'evidence_schema.py', 'relation_evidence.py', 'scientometrics_ontology.py',
-                 'prompts_zh.py', 'validation_agent.py', 'evaluation_agent.py', 'triplet_metrics.py',
+                 'prompts_zh.py', 'validation_agent.py', 'evaluation_agent.py', 'evaluation_rubric.py', 'triplet_metrics.py',
                  'experiments/full_first_paper.py']
-    if args.compact_bge:
-        names += ['evidence_chunking.py','evidence_retrieval.py','experiments/relation_chain_first_pool.py']
+    names += ['evidence_chunking.py','evidence_retrieval.py','compact_evidence.py']
+    names += ['entity_names.py','extraction_policy.py','semantic_prompts.py','semantic_judgment.py','judgment_policy.py']
     for name in names:
         raw = (ROOT / 'extraction' / name).read_bytes()
         dest = out / 'code' / name
@@ -92,10 +110,11 @@ def main():
 
     def perform(operation):
         cl = OpenAI(api_key=os.environ['DEEPSEEK_API_KEY'], base_url=os.getenv('DEEPSEEK_BASE_URL'),
-                    timeout=180, max_retries=2 if args.compact_bge else 0)
+                    timeout=180, max_retries=2 if args.evidence_retrieval=='compact' else 0)
         create = cl.chat.completions.create
         last = None
         def cached(**kw):
+            kw = adapt_request(kw)
             nonlocal last
             h = hashlib.sha256(json.dumps(kw, sort_keys=True, ensure_ascii=False).encode()).hexdigest()
             dest = out / 'api_calls' / f'{h}.json'
@@ -125,17 +144,26 @@ def main():
         if dest.exists():
             data = json.loads(dest.read_text())
         else:
-            data = perform(lambda cl:extract(cl, model, text, 16384))
+            data = perform(lambda cl:extract(cl, model, text, args.extraction_max_tokens,args.extraction_thinking))
             save(dest, data)
         print('Fresh entities:', len(data['entities_extracted']), 'direct candidates:',
               len(data['kg_extraction_triplets']), flush=True)
+        if args.extract_only:
+            summary = dict(complete=True, scope='extraction_only', extraction_requests=2,
+                indicator_entities=len(data['entities_extracted']),
+                direct_candidates=len(data['kg_extraction_triplets']),
+                elapsed_seconds_this_invocation=round(time.monotonic()-started, 2),
+                finished_utc=datetime.now(timezone.utc).isoformat())
+            save(out / 'summary.json', summary)
+            save(out / 'status.json', dict(complete=True, scope='extraction_only'))
+            print(json.dumps(summary, ensure_ascii=False), flush=True)
+            return
         stage = 'ontology'
         annotate_scientometrics(data)
         save(out / '03_ontology.json', data)
         stage = 'evidence_and_validation'
         oriented = {}
-        if args.compact_bge:
-            index = CompactEvidenceIndex(text,FrozenBGE(args.compact_bge))
+        if args.evidence_retrieval=='compact':
             for i,t in enumerate(data['kg_extraction_triplets']):
                 if not t['ontology_conformed'] or (out/'validation_checkpoints'/f'{i:04d}.json').exists():
                     continue
@@ -151,18 +179,7 @@ def main():
             if t['ontology_conformed']:
                 def collect(cl):
                     candidate = copy.deepcopy(oriented.get(i,original))
-                    if args.compact_bge:
-                        collect_evidence(candidate,index,cl,model,
-                            annotator=partial(annotate_pool,decomposed=True,task_scoped=True),
-                            selector=partial(select_evidence,decomposed=True,task_scoped=True,
-                                             explicit_variant_scopes=True),
-                            validator=partial(validate_relation_conditions,cl,model))
-                        candidate['evidence_completion']['proof_orientation'] = [
-                            candidate['source_entity_instance'],candidate['target_entity_instance']]
-                        for field in ('source_entity_instance','target_entity_instance'):
-                            candidate[field] = original[field]
-                    else:
-                        collect_evidence(candidate,index,cl,model)
+                    collect_indexed_evidence(candidate,index,cl,model)
                     return candidate
                 t = perform(collect)
             else:
@@ -174,7 +191,6 @@ def main():
         with ThreadPoolExecutor(max_workers=args.workers) as pool:
             data['kg_extraction_triplets'] = list(pool.map(validate, enumerate(data['kg_extraction_triplets'])))
         verify_evidence(data, text)
-        enforce_relation_exclusivity(data)
         save(out / '04_validated.json', data)
         stage = 'evaluation'
         def evaluate(item):
@@ -184,9 +200,10 @@ def main():
                 return json.loads(dest.read_text())
             t = copy.deepcopy(original)
             def evaluate_once(cl):
-                response = evaluate_triplet(cl,'deepseek',model,t)
-                return response,parse_label(response)
-            t['evaluation_response'],t['eval'] = perform(evaluate_once)
+                return evaluate_triplet_assessment(cl,'deepseek',model,t)
+            t['evaluation_details']=perform(evaluate_once)
+            t['evaluation_response']=t['evaluation_details']['verdict']
+            t['eval']=parse_label(t['evaluation_response'])
             save(dest, t)
             print(f'Evaluator {i}: {t["eval"]}', flush=True)
             return t

@@ -1,44 +1,28 @@
-# 严格旧流程＋当前中文提示词
+# 统一抽取＋旧流程后续处理
 
-用户要求：除提示词外，其余计算流程全部对照 `cb2e962b1ab836f8ba1060c25895124f43dd1b57`，用于旧新流程对比。
+当前入口每篇2次全文请求：
 
-## 入口如何保证一致
+1. 调用与新流程相同的联合抽取函数和Schema，一次返回论文信息、指标实体清单及属性。
+2. 基于该清单一次抽取全部8种关系，逐条同时给出连续原文 `paragraph`。禁止新增清单外端点，使用相同关系判定规则、名称规范和去重逻辑。
 
-`experiments/migrated_baseline/run.py` 不再手工仿写旧抽取函数，也不调用当前验证器兼容分支；而是从本目录 `frozen/` 读取以下8个模块的提交原文，并逐文件验证 `manifest.json` 中的SHA256，在隔离的Python模块环境中直接执行：
+新流程第二次不生成paragraph，证据留给后续检索。旧消费者要求属性evidence为字符串时，启动器只从联合响应中选择包含属性text的单个片段，不拼接或改写证据。`--entity-constrained-relations` 为兼容旧命令保留；当前始终约束实体清单。
 
-- models.py：旧响应Schema。
-- scientometrics_ontology.py：旧本体、端点、方向与初始互斥检查。
-- evidence_validation_agent.py：旧模糊证据核验。
-- local_formula_evidence.py：旧紧邻公式补全。
-- validation_agent.py：旧Validator调用与解析。
-- evaluation_agent.py：旧Evaluator调用与解析。
-- triplet_metrics.py：旧阶段统计。
-- extract_md_deepseek.py：旧四阶段抽取、验证及评估main原实现。
+启动器仍校验并隔离加载 `frozen/` 的8个历史模块，源码没有修改；只在运行时把旧extract替换为共享两请求抽取。随后继续使用旧本体、旧模糊证据匹配、旧Validator输入门控及共享独立Evaluator。该模式标记为 `unified_legacy_paragraph`，不称为严格旧四请求复现。
 
-这些源文件没有修改。启动器只注入运行时工作区 `prompts_zh.py` 的当前中文提示词，并给详情提示词补充旧Schema所需的“evidence为字符串”说明。旧extract函数原有的实体清单措辞替换继续由原函数执行。共享工作区提示词不被改写，新流程也不受影响。
-
-外层启动器负责新目录保护、源码／提示词快照、API请求日志和完成后的摘要副本，不改变旧流程的抽取、筛选或模型请求参数，不复用响应缓存。冻结文件已随基线目录保存，启动不再依赖Git提交对象；文件缺失、清单不符或哈希改变会直接报错，不静默改用最新代码。
-
-## 实际计算流程
-
-```mermaid
-flowchart TD
-    A[Markdown全文] --> M[元数据请求]
-    A --> D[指标详情请求：evidence字符串]
-    A --> E[实体请求]
-    A --> R[关系与证据请求：paragraph字符串]
-    M -- 论文身份 --> R
-    R --> O[旧本体检查：含初始互斥]
-    E -- 事后端点检查 --> O
-    O --> P[旧模糊证据核验]
-    P --> V[旧Validator：直接接收字符串]
-    V --> Q[旧Evaluator：评估全部关系、直接接收字符串]
-    Q --> S[旧阶段统计与C_triplet]
+```bash
+.venv/bin/python extraction/experiments/migrated_baseline/run.py --check-only
+.venv/bin/python extraction/experiments/migrated_baseline/run.py \
+  --backend zrshuiwu --model deepseek-v4.1-flash-1017 --thinking disabled \
+  --extract-only --markdown "/path/to/full.md" --output reports/old_extract_only_run1
 ```
 
-四次全文请求顺序为元数据→详情→实体→关系与证据；关系请求不消费实体清单或详情。
+`--extract-only` 只保存抽取结果、配置、请求审计和完成状态，不运行本体、证据匹配、Validator、Evaluator。完整运行省略此开关。批量入口同样使用统一抽取；代码或提示词变化后需换新输出目录。
 
-重要纠正：cb2e962原本已有variant_of／derived_from互斥，在本体检查阶段将同一有向对的竞争标签标为不合法，不依赖Validator是否通过。严格基线保留此原行为，不能误称原版没有互斥。它不执行当前方法的验证后冲突门控。
+服务商支持deepseek、vllm、zrshuiwu，凭据沿用各自配置，原服务商保留。见[接入说明](../../README.md#zrshuiwu-服务商接入)。
+
+## 历史四请求行为记录
+
+以下为先前严格旧流程的记录。当前抽取已按上面的两请求协议统一，历史实验输出及冻结代码不重写。
 
 ## 已撤销上一版兼容入口的变化
 
@@ -161,3 +145,9 @@ flowchart TD
 - 参数必须为正整数；超过清单长度时处理全部已有论文。先加dry-run可查看本次计划。
 
 当前8项批量测试通过，包含前1篇→前2篇→全清单扩展且只运行新增论文、重复范围不重跑、原manifest不变、限定范围完成时不因范围外待处理而报错，以及限制范围的dry-run无API副作用。未启动实际前50篇处理。
+
+## Validator前置门控（2026-11-12）
+
+默认仅将ontology_conformed=true且evidence_validated=true的关系送入旧二元Validator。未送验记录保留，标记validator_called=false及not_sent_prior_filters，不作为实际Validator拒绝统计。适配层改变输入调度，frozen源码不变。需要复现先前全量送验行为时，单篇及批量入口传--ungated-validator。已有批次配置变化须另建输出目录，不能与旧计数混合续跑。summary与batch_summary另记录实际送验/通过/拒绝/跳过数。
+
+2026-11-12：旧抽取/Validator仍用冻结实现；Evaluator由启动适配层接入当前独立证据评估，兼容paragraph，保留valid、单独写eval。运行配置记录共享Evaluator源码校验值，launcher_code保存当前实现。旧历史实验仍使用对应历史快照。

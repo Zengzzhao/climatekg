@@ -1,11 +1,11 @@
-"""Local type and endpoint checks for the scientific-metrics domain."""
+"""Local type, endpoint and candidate-exclusivity checks."""
 import unicodedata
 import re
 
 
 def _name_key(name):
     """Typography only: preserve letters, case, suffixes and numeric versions."""
-    name = unicodedata.normalize('NFKC', name)
+    name = unicodedata.normalize('NFC', name)
     # Math delimiters and braces on a simple sub/superscript are typography,
     # not semantic aliases. Keep the actual symbols, indices and suffixes.
     name = name.replace('$', '')
@@ -31,6 +31,14 @@ def annotate_scientometrics(data):
     for name in rank:
         spellings.setdefault(_name_key(name), set()).add(name)
     for t in triplets:
+        t.pop('relation_constraint_conflict', None)
+        # Relation generation may replace NBSPs or typographic hyphens in the
+        # current paper title. Preserve paper identity across this lossless change.
+        if (t['source_entity_type'] == 'Paper' and paper
+                and t['source_entity_instance'] != paper
+                and _name_key(t['source_entity_instance']) == _name_key(paper)):
+            t.setdefault('entity_name_normalization', {})['source_entity_instance'] = t['source_entity_instance']
+            t['source_entity_instance'] = paper
         for side in ('source', 'target'):
             field = f'{side}_entity_instance'
             if t[f'{side}_entity_type'] != 'Indicator' or t[field] in rank:
@@ -49,23 +57,19 @@ def annotate_scientometrics(data):
             if rank[s] > rank[d]:
                 t['source_entity_instance'], t['target_entity_instance'] = d, s
         t['ontology_conformed'] = bool(valid)
-    # Candidate hypotheses may conflict; enforce exclusion after independent validation.
+    enforce_relation_exclusivity(data)
     return sum(t['ontology_conformed'] for t in triplets), sum(not t['ontology_conformed'] for t in triplets)
 
 
 def enforce_relation_exclusivity(data):
-    """Gate unresolved competing survivors without using Evaluator or preferring a label.
+    """Reject competing candidates during ontology checking, before evidence retrieval.
 
-    Unioned discovery hypotheses are allowed to compete through evidence validation.
-    If both exclusive labels survive for the same typed, ordered pair, neither is
-    ontology-conformant for final retention. Preserve Validator/evidence verdicts
-    and record the conflict for adjudication rather than treating either as false.
-    Run after validation and before evaluation/final retention.
+    Only otherwise ontology-conformant candidates participate. Do not choose a
+    preferred label or depend on evidence, Validator or Evaluator verdicts.
     """
     groups = {}
     for t in data['kg_extraction_triplets']:
-        if t['relation'] in EXCLUSIVE_RELATIONS and all(
-                t.get(f) for f in ('ontology_conformed', 'evidence_validated', 'valid')):
+        if t['relation'] in EXCLUSIVE_RELATIONS and t.get('ontology_conformed'):
             key = tuple(t[f] for f in ('source_entity_type', 'source_entity_instance',
                                       'target_entity_type', 'target_entity_instance'))
             groups.setdefault(key, []).append(t)
@@ -78,5 +82,6 @@ def enforce_relation_exclusivity(data):
             t['ontology_conformed'] = False
             t['relation_constraint_conflict'] = dict(
                 reason='mutually_exclusive_labels', labels=sorted(EXCLUSIVE_RELATIONS),
-                resolution='unresolved; neither retained; requires evidence-based adjudication')
+                stage='ontology',
+                resolution='unresolved candidate conflict; neither retained')
     return conflicts

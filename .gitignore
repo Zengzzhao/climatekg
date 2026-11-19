@@ -15,11 +15,20 @@ extraction/experiments/output/
 extraction/experiments/data/
 kg_create/data/
 
-# Built by scripts/build_hf_dataset.py, uploaded to Hugging Face
-hf_release/
-
 .venv/
 
 reports/
 output/
 data_get/
+tmp/
+tests/
+outputs/
+# Keep the extraction identity and recall regressions reviewable.
+!extraction/tests/
+extraction/tests/*
+!extraction/tests/test_entity_names.py
+!extraction/tests/test_extraction_recall_protocol.py
+!extraction/tests/test_source_recovery.py
+!extraction/tests/test_entity_identity.py
+!extraction/tests/test_llm_backend.py
+thesis/

@@ -24,6 +24,7 @@ from validation_agent import create_client, generate_label, resolve_model, parse
 from tqdm import tqdm
 
 
+
 SCRIPT_DIR = Path(__file__).resolve().parent
 REPO_ROOT = SCRIPT_DIR.parent
 DEFAULT_MODEL = "gemini-2.5-flash"
@@ -70,6 +71,14 @@ def triplet_value(triplet: dict, key: str, fallback_key: str | None = None) -> s
 
 
 def evaluate_triplet(client, provider: str, model: str, triplet: dict) -> str:
+    return evaluate_triplet_assessment(client,provider,model,triplet)['verdict']
+
+
+def evaluate_triplet_assessment(client,provider: str,model: str,triplet: dict,*,requirements=None) -> dict:
+    """Evidence-only independent assessment, without prior-stage flags or gold."""
+    if provider=='deepseek':
+        result=_evaluate_structured(client,model,triplet)
+        return apply_evidence_requirements(result,triplet,requirements)
     template = multi_evidence_evaluation_prompt() if "evidence" in triplet or triplet.get("evidence_units") else EVALUATION_PROMPT
     prompt = template.format(
         source=triplet_value(
@@ -88,10 +97,29 @@ def evaluate_triplet(client, provider: str, model: str, triplet: dict) -> str:
         paragraph=evidence_text(triplet),
     )
 
-    return generate_label(client, provider, model, prompt)
+    label=generate_label(client, provider, model, prompt)
+    return apply_evidence_requirements(dict(verdict='valid' if parse_label(label) else 'invalid',raw=label),triplet,requirements)
 
 
-def evaluate_data(data: dict, client, provider: str, model: str) -> tuple[int, int]:
+def apply_evidence_requirements(result,triplet,requirements=None):
+    if requirements is None:return result
+    from evaluation_rubric import check_requirements
+    raw=triplet.get('evidence',triplet.get('evidence_units',triplet.get('paragraph','')))
+    if isinstance(raw,str):raw=[raw]
+    coverage=check_requirements([u if isinstance(u,str) else u['text'] for u in raw],requirements)
+    result=dict(result,semantic_verdict=result['verdict'],reference_coverage=coverage)
+    if not coverage['passed']:
+        result['verdict']='invalid'
+        result['missing_conditions']=result.get('missing_conditions',[])+['annotated_evidence_requirements']
+    return result
+
+
+def _evaluate_structured(client,model,triplet):
+    from semantic_judgment import judge_triplet
+    return judge_triplet(client,model,triplet,'evaluator')
+
+
+def evaluate_data(data: dict, client, provider: str, model: str,*,requirements_by_key=None) -> tuple[int, int]:
     """Evaluate all triples independently; retain valid and all prior stage verdicts."""
     triplets = data.get("kg_extraction_triplets", [])
     if not isinstance(triplets, list):
@@ -102,10 +130,16 @@ def evaluate_data(data: dict, client, provider: str, model: str) -> tuple[int, i
         if not isinstance(triplet, dict):
             raise ValueError("kg_extraction_triplets must contain objects")
 
-        validation_result = evaluate_triplet(client, provider, model, triplet)
+        key=tuple(triplet_value(triplet,k) for k in ('source_entity_instance','relation','target_entity_instance'))
+        requirement=(requirements_by_key or {}).get(key)
+        details=evaluate_triplet_assessment(client,provider,model,triplet,requirements=requirement)
+        if requirements_by_key is not None:
+            details['reference_status']='configured' if key in requirements_by_key else 'not_configured'
+        validation_result = details['verdict']
         is_valid = parse_label(validation_result)
         triplet["evaluation_response"] = validation_result
         triplet["eval"] = is_valid
+        triplet['evaluation_details']=details
         if is_valid:
             eval_valid_count += 1
 
@@ -117,10 +151,11 @@ def process_file(
     output_dir: Path,
     provider: str,
     model: str,
+    requirements_by_key=None,
 ) -> tuple[int, int]:
     client = create_client(provider)
     data = json.loads(json_path.read_text(encoding="utf-8"))
-    triplet_count, eval_valid_count = evaluate_data(data, client, provider, model)
+    triplet_count, eval_valid_count = evaluate_data(data, client, provider, model,requirements_by_key=requirements_by_key)
 
     output_path = output_dir / json_path.name
     with output_path.open("w", encoding="utf-8") as f:
@@ -137,6 +172,7 @@ def evaluate_papers(
     model: str,
     max_workers: int,
     force: bool,
+    requirements_by_key=None,
 ) -> dict[str, int]:
     if not input_dir.exists():
         raise FileNotFoundError(f"Validated paper directory not found: {input_dir}")
@@ -163,6 +199,7 @@ def evaluate_papers(
         output_dir=output_dir,
         provider=provider,
         model=model,
+        requirements_by_key=requirements_by_key,
     )
     with concurrent.futures.ThreadPoolExecutor(max_workers=max_workers) as executor:
         futures = {executor.submit(worker, json_path): json_path for json_path in json_paths}
@@ -210,7 +247,9 @@ def parse_args() -> argparse.Namespace:
     )
     parser.add_argument(
         "--model",
-        default=os.getenv("DEEPSEEK_MODEL", "deepseek-chat"),
+        default=(os.getenv("VLLM_MODEL", "Qwen/Qwen3-32B-AWQ")
+                 if os.getenv("EXTRACTION_BACKEND") == "vllm"
+                 else os.getenv("DEEPSEEK_MODEL", "deepseek-chat")),
         help=(
             "Model selector. Defaults to DEEPSEEK_MODEL or deepseek-chat. "
             "Pass 'gpt' to use gpt-5-mini-2025-08-07."
@@ -227,6 +266,7 @@ def parse_args() -> argparse.Namespace:
         action="store_true",
         help="Reprocess files that already exist in the output directory.",
     )
+    parser.add_argument('--evidence-rubric',type=Path,help='Optional JSON list with source/relation/target and OR-of-AND groups of required original quotes; local reject-only gate')
     return parser.parse_args()
 
 
@@ -236,6 +276,10 @@ def main() -> None:
     input_dir = args.input_dir or default_input_dir(args.date)
     output_dir = args.output_dir or default_output_dir(args.date)
     provider, resolved_model = resolve_model(args.model)
+    requirements_by_key=None
+    if args.evidence_rubric:
+        entries=json.loads(args.evidence_rubric.read_text(encoding='utf-8-sig'))
+        requirements_by_key={tuple(r[k] for k in ('source','relation','target')):r['groups'] for r in entries}
 
     stats = evaluate_papers(
         input_dir=input_dir,
@@ -244,6 +288,7 @@ def main() -> None:
         model=resolved_model,
         max_workers=args.max_workers,
         force=args.force,
+        requirements_by_key=requirements_by_key,
     )
 
     print("\nEvaluation Summary")

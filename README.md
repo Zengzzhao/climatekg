@@ -12,7 +12,7 @@ ClimateKG 是一个面向气候科学论文的本体引导知识图谱项目。A
 | [`extraction/experiments/climate_baseline/`](extraction/experiments/climate_baseline/) | 原气候论文抽取、证据核验和实体对齐工具 |
 | [`kg_create/`](kg_create/) | 气候图谱构建、Neo4j 导入和 RDF 导出 |
 | [`data/`](data/) | 发布版图谱、逐论文流水线结果和论文元数据 |
-| [`scripts/`](scripts/) | 解压发布数据和构建 Hugging Face 数据集 |
+| [`scripts/`](scripts/) | 发布数据解包和可选的模型服务诊断 |
 
 ## 环境配置
 
@@ -24,11 +24,13 @@ source .venv/bin/activate
 python -m pip install -r requirements.txt
 ```
 
-首次配置科学计量流程时，将 `extraction/.env.example` 复制为 `extraction/.env`，填写 `DEEPSEEK_API_KEY`，并按服务配置 `DEEPSEEK_BASE_URL` 和 `DEEPSEEK_MODEL`。基址填到 API 根路径。`python extraction/check_api.py` 会发送两条请求，检查 JSON 抽取和二元标签接口。CUC 校园服务配置见[抽取工程说明](extraction/README.md#cuc模型api接入)。
+首次配置科学计量流程时，将 [`extraction/.env.example`](extraction/.env.example) 复制为 `extraction/.env`。新旧流程均支持 `--backend deepseek`（默认，含 [CUC](extraction/README.md#cuc模型api接入)）、[`vllm`](extraction/README.md#vllm-服务商接入) 和 [`zrshuiwu`](extraction/README.md#zrshuiwu-服务商接入)，分别读取 `DEEPSEEK_*`、`VLLM_*` 和 `ZRSHUIWU_*` 配置。基址填到 API 根路径，不加 `/chat/completions`。
+
+`python extraction/check_api.py --backend deepseek` 会发送两条请求，检查 JSON 抽取和二元标签接口；换用其他服务时替换后端名称。[vLLM 专用诊断](scripts/README_vllm.md)和[中转服务探测](scripts/probe_zrshuiwu.py)不参与正式抽取。
 
 ## PDF 转 Markdown
 
-MinerU 读取 `MINERU_TOKEN`、`MINERU_API_TOKEN` 或 `data_get/.mineru-token`。先加 `--dry-run` 确认输入范围，再去掉该参数执行。脚本按论文保存 Markdown 和配图，在输出根目录的 `.mineru/` 下记录进度。
+如果只运行 MinerU，可单独安装 `data_get/requirements.txt` 中的依赖。MinerU 读取 `MINERU_TOKEN`、`MINERU_API_TOKEN` 或 `data_get/.mineru-token`。先加 `--dry-run` 确认输入范围，再去掉该参数执行。脚本按论文保存 Markdown 和配图，在输出根目录的 `.mineru/` 下记录进度。
 
 ```bash
 bash data_get/run_mineru.sh \
@@ -36,7 +38,7 @@ bash data_get/run_mineru.sh \
   --year 2024 --limit 3 --dry-run
 ```
 
-对已完成的年份，可运行下方命令核对 PDF、Markdown 和图片引用。更多选项见 [MinerU 使用说明](data_get/README.md)。
+对已完成的年份，可运行下方命令核对 PDF、Markdown 和图片引用。需要保存逐篇报告时加 `--report <文件路径>`；历史核验报告不随仓库提供。更多选项见 [MinerU 使用说明](data_get/README.md)。
 
 ```bash
 python data_get/verify_mineru_output.py \
@@ -53,12 +55,14 @@ python extraction/extract_md_deepseek.py \
   --paper-id paper_001 --output-root reports/scientometrics_single
 ```
 
-主入口从同一份论文全文发起四次抽取请求，依次取得论文元数据、`Indicator` 实体、受实体清单约束的关系候选，以及指标的定义、公式和局限。关系端点支持 `Paper → Indicator` 和 `Indicator → Indicator`，关系类型见 [中文提示词](extraction/prompts_zh.py)。
+新旧流程均使用 2 次全文请求：先联合抽取论文信息、指标实体及属性，再基于该清单抽取全部 8 种关系。新流程第二次只输出关系，证据留给后续检索；旧流程同时输出连续的原文 `paragraph`。两边均禁止新增清单外端点；属性及别名只用于约束和定位，不能代替原文关系证据。
 
-1. 本体检查核对候选的端点、关系类型和方向。
-2. 系统按候选关系检索 12 个原文单元，标注证据角色，再由模型联合选择原文片段。每条关系最多选择 6 段、14,000 个原文字符。角色覆盖用于诊断，证据能回指原文即可交给 Validator 核验。
-3. Validator 返回 `verdict`、`reason`、`missing_evidence` 和 `search_queries`。首次拒绝后，系统最多根据反馈补检一次，并从合并后的池中重新选证。关系的 `evidence` 是对象数组，每项包含 `id`、`section`、`text`、`start`、`end`，其中 `text` 必须等于 `markdown[start:end]`。每轮检索、选证和验证记录在 `evidence_completion.trace` 中。
-4. 关系保留要求 `ontology_conformed`、`evidence_validated`、`valid` 均为 `true`。同一有向指标对的 `variant_of` 和 `derived_from` 如果都通过证据核验和 Validator，两条均标记为本体冲突并排除。Evaluator 独立复评全部候选，`eval` 只用于统计。
+新流程默认开启抽取推理，单篇可用 `--thinking disabled` 关闭，带完整记录的单篇和批量入口用 `--extraction-thinking disabled`。两种单篇入口均支持 `--extract-only`，只保存原始抽取结果。完整运行默认使用[本地 BGE 检索模型](extraction/README.md#默认检索与语义分片)；未配置权重时可用 `--evidence-retrieval sparse` 改用稀疏检索。
+
+1. 本体检查核对候选的端点、关系类型和方向，并检查互斥：同一有向指标对的合法候选同时含有 `variant_of` 和 `derived_from` 时，两条均标记为本体冲突，不进入关系证据检索与 Validator。
+2. 新流程按完整句子、带引导文字和变量定义的公式块、整表分片，不使用固定字符窗口。默认每条候选首轮最多检索 12 个原文单元，由模型联合选择最多 6 段核心证据，并可从已召回池补齐最多 2 段相邻上下文，总预算为 14,000 个原文字符。角色覆盖用于诊断；证据数组非空、且每个片段与全文的 RapidFuzz 模糊匹配得分均 ≥ 80 时，才交给 Validator 核验。
+3. Validator 返回 `verdict`、`reason`、`missing_evidence` 和 `search_queries`。首次拒绝后，系统最多根据反馈补检一次，并从合并后的池中重新选证。关系的 `evidence` 是对象数组，每项包含 `id`、`section`、`text`、`start`、`end`。分片与选证直接取原文；`text == markdown[start:end]` 的严格检查仅用于审计，不作为模糊匹配之外的通过条件。每轮检索、选证和验证记录在 `evidence_completion.trace` 中。
+4. 关系保留要求 `ontology_conformed`、`evidence_validated`、`valid` 均为 `true`。Evaluator 独立复评全部候选，`eval` 只用于统计。
 
 单篇入口在 `<output-root>/<stage>/<date>/<paper-id>.json` 保存五个阶段的快照，并在 `<output-root>/reports/<date>/<paper-id>/` 生成 `table3.json`、`table3.csv` 和 `table3.md`。阶段目录依次为 `extracted_papers`、`ontology_conformed_papers`、`evidence_validated_papers`、`validated_papers` 和 `evaluated_papers`。默认使用当天日期和 Markdown 文件名。运行时可用 `--no-relation-evidence` 切换到 Top-k 选证，或用 `--evidence-rounds 0` 关闭补检。`--validator-model` 和 `--evaluator-model` 可分别指定验证与评估模型。
 
@@ -75,16 +79,23 @@ python extraction/batch_extract.py \
 
 `--stop-after` 保留全量清单，允许在同一批次扩大处理范围。已完成的论文会跳过，使用 `--retry-failed` 可为失败项新建尝试目录。输入、单篇代码、提示词或模型配置变化时使用新的输出目录。`--workers` 控制每篇内部验证和评估的并发数。
 
-批次根目录保存 `manifest.json`、`batch_summary.json` 和 `report.md`。每篇的 `papers/<paper_id>/attempt_<编号>/` 保存阶段 JSON、`final_graph.json`、统计表、源码快照和 API 请求记录。若只运行一篇且需要相同的实验记录，可以直接使用 `extraction/experiments/full_first_paper.py`，传入 `--markdown` 和 `--output`。详细参数和输出见[抽取工程说明](extraction/README.md)。
+批次根目录保存 `manifest.json`、`batch_summary.json` 和 `report.md`。每篇的 `papers/<paper_id>/attempt_<编号>/` 保存阶段 JSON、`final_graph.json`、统计表、源码快照和 API 请求记录。批量实际调用 [`full_first_paper.py`](extraction/experiments/full_first_paper.py)，也可用该入口传入 `--markdown` 和 `--output`，单独处理一篇并保留同样的记录。示例中的 `reports/` 是本地输出目录，不是仓库附带的数据。详细参数见[抽取工程说明](extraction/README.md)。
 
 `C_triplet` 按阶段计算，为该阶段剩余关系中 Evaluator 判为有效的比例。批次统计按关系条数汇总。该指标反映模型复评结果。
 
 ### 旧科学计量基线
 
-旧基线隔离加载 `cb2e962` 的 8 个冻结模块，并注入当前中文提示词，其中 Validator 使用 `LEGACY_VALIDATION_PROMPT`。它保留字符串 `paragraph`、旧本体互斥和旧裁判调用方式。可先离线校验冻结源码，再用 `--markdown` 和 `--output` 启动单篇对照。批量对照使用该目录的 `batch.py`，另设输出目录。参见[旧基线说明](extraction/experiments/migrated_baseline/README.md)。
+旧基线隔离加载 `cb2e962` 的 8 个冻结模块。它复用当前的全文抽取和独立 Evaluator，保留字符串 `paragraph`、旧本体和原文证据核验，Validator 使用 `LEGACY_VALIDATION_PROMPT`。旧流程默认关闭抽取推理，可用 `--thinking enabled` 开启。单篇和批量对照应使用与新流程不同的输出目录。参见[旧基线说明](extraction/experiments/migrated_baseline/README.md)。
 
 ```bash
 python -m extraction.experiments.migrated_baseline --check-only
+
+python -m extraction.experiments.migrated_baseline \
+  --markdown /path/to/paper/full.md --output reports/legacy_single
+
+python extraction/experiments/migrated_baseline/batch.py \
+  --input-root /path/to/markdown/2024 --output reports/legacy_batch \
+  --stop-after 5 --dry-run
 ```
 
 ## 气候图谱发布版
@@ -115,17 +126,6 @@ python extraction/experiments/stage_ablation.py
 ```bash
 cd kg_create
 python upload_neo4j.py --date 20260622
-```
-
-### Hugging Face
-
-`v1` 对应 2,000 篇论文的发布版，`v2` 对应 10,910 篇论文的扩展版。字段、版本和导出说明见 [Hugging Face 数据集卡](huggingface/README.md)。
-
-```python
-from datasets import load_dataset
-
-nodes = load_dataset("aayushacharya/climatekg", "v1-nodes", split="train")
-edges = load_dataset("aayushacharya/climatekg", "v1-edges", split="train")
 ```
 
 ## 许可证与引用

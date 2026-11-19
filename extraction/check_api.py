@@ -2,33 +2,35 @@
 import argparse
 from datetime import datetime, timezone
 import json
-import os
 from pathlib import Path
 
 from dotenv import load_dotenv
-from openai import OpenAI
+from llm_backend import add_backend_argument, configure_backend, openai_client as OpenAI
 from validation_agent import generate_label, parse_label, resolve_model
 
 
 def main():
     load_dotenv(Path(__file__).resolve().parent / '.env')
     parser = argparse.ArgumentParser(description=__doc__)
-    parser.add_argument('--model', default=os.getenv('DEEPSEEK_MODEL', 'deepseek-chat'))
-    parser.add_argument('--base-url', default=os.getenv('DEEPSEEK_BASE_URL', 'https://api.deepseek.com'))
+    parser.add_argument('--model')
+    parser.add_argument('--base-url')
     parser.add_argument('--timeout', type=float, default=30)
     parser.add_argument('--output', type=Path, help='可选：保存不含密钥的连通报告')
+    add_backend_argument(parser)
     args = parser.parse_args()
-    key = os.getenv('DEEPSEEK_API_KEY')
-    if not key:
-        parser.error('请在 extraction/.env 中配置 DEEPSEEK_API_KEY')
+    try:
+        backend = configure_backend(args)
+    except ValueError as error:
+        parser.error(str(error))
+    key = backend.api_key
     if args.timeout <= 0:
         parser.error('timeout必须为正数')
     if args.base_url.rstrip('/').endswith('/chat/completions'):
         parser.error('base-url应填写API基址，例如 https://openai.cuc.edu.cn/v1')
     provider, model = resolve_model(args.model)
     if provider != 'deepseek':
-        parser.error('此检查用于DeepSeek或CUC的OpenAI兼容模型')
-    report = dict(base_url=args.base_url, requested_model=model,
+        parser.error('此检查用于选定服务商的OpenAI兼容模型')
+    report = dict(backend=backend.name, base_url=args.base_url, requested_model=model,
                   checked_at=datetime.now(timezone.utc).isoformat(), complete=False)
     try:
         with OpenAI(api_key=key, base_url=args.base_url, timeout=args.timeout, max_retries=0) as client:

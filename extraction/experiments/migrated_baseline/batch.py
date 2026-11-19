@@ -10,10 +10,14 @@ from pathlib import Path
 import subprocess
 import sys
 from zoneinfo import ZoneInfo
-from dotenv import dotenv_values
+from dotenv import load_dotenv
 
 HERE=Path(__file__).resolve().parent
 ROOT=HERE.parents[2]
+sys.path.insert(0,str(ROOT/'extraction'))
+from llm_backend import add_backend_argument, configure_backend
+from batch_extract import select_papers
+
 
 
 def digest(raw):
@@ -84,6 +88,14 @@ def aggregate(out,papers,*,stem='batch'):
                  attempts=len(attempts),status='completed' if completed else ('failed_or_interrupted' if attempts else 'pending'))
         if completed:
             row.update(result_directory=str(completed),summary=summary)
+            if 'validator_input_count' in summary:
+                row['validator_counts']=dict(input=summary['validator_input_count'],passed=summary['validator_pass_count'],
+                    skipped=summary['validator_skipped_count'])
+            else:
+                triplets=read(Path(summary['evaluated_file']))['kg_extraction_triplets']
+                row['validator_counts']=dict(input=sum(t.get('validator_called',True) for t in triplets),
+                    passed=sum(t.get('validator_called',True) and t['valid'] for t in triplets),
+                    skipped=sum(not t.get('validator_called',True) for t in triplets))
             table=load_stage_table(summary)
             for stage in table['rows']:
                 item=stages.setdefault(stage['stage'],dict(stage=stage['stage'],output_triplets=0,evaluator_correct=0))
@@ -95,6 +107,10 @@ def aggregate(out,papers,*,stem='batch'):
     kept=sum(r['summary']['kept'] for r in complete)
     positive=sum(r['summary']['evaluator_positive_kept'] for r in complete)
     result=dict(papers_total=len(papers),papers_completed=len(complete),
+        validator_actual_input=sum(r['validator_counts']['input'] for r in complete),
+        validator_actual_pass=sum(r['validator_counts']['passed'] for r in complete),
+        validator_actual_reject=sum(r['validator_counts']['input']-r['validator_counts']['passed'] for r in complete),
+        validator_not_sent=sum(r['validator_counts']['skipped'] for r in complete),
         papers_failed_or_interrupted=sum(r['status']=='failed_or_interrupted' for r in records),
         papers_pending=sum(r['status']=='pending' for r in records),
         candidates=sum(r['summary']['candidates'] for r in complete),kept=kept,evaluator_positive_kept=positive,
@@ -124,6 +140,10 @@ def main():
     scope=parser.add_mutually_exclusive_group()
     scope.add_argument('--limit',type=int,help='截断实验清单，仅选前N篇；需要单独输出目录，后续不能在原目录扩展')
     scope.add_argument('--stop-after',type=int,help='保留完整清单，本次仅处理按标题排序的前N篇（包括已完成项）；可在同目录增大N续跑')
+    scope.add_argument('--paper-list',type=Path,help='Explicit ordered subset with paper IDs and document SHA256')
+    parser.add_argument('--entity-constrained-relations',action='store_true',
+                        help='Only change legacy relation extraction to consume the indicator inventory')
+    parser.add_argument('--ungated-validator',action='store_true',help='Reproduce historical all-record Validator input')
     parser.add_argument('--retry-failed',action='store_true',help='显式从头重试失败论文，保留原尝试目录；不重跑成功论文')
     parser.add_argument('--model')
     parser.add_argument('--validator-model')
@@ -133,6 +153,9 @@ def main():
     parser.add_argument('--thinking',choices=('disabled','enabled'),default='disabled')
     parser.add_argument('--no-local-formula-completion', action='store_true',
                         default=True, help=argparse.SUPPRESS)
+    load_dotenv(ROOT/'extraction/.env')
+    add_backend_argument(parser)
+    parser.add_argument('--base-url')
     args=parser.parse_args()
     root=args.input_root.expanduser().resolve();out=args.output.expanduser().resolve()
     if not root.is_dir():parser.error('input-root不是目录')
@@ -140,6 +163,9 @@ def main():
     if args.stop_after is not None and args.stop_after<1:parser.error('stop-after必须为正数')
     if not 0<=args.threshold<=100 or args.max_tokens<1:parser.error('阈值或token预算无效')
     papers,missing=scan(root)
+    if args.paper_list:
+        try:papers=select_papers(papers,args.paper_list)
+        except (ValueError,OSError) as error:parser.error(str(error))
     if args.limit:papers=papers[:args.limit]
     if not papers:parser.error('没有找到论文子目录中的full.md')
     scheduled=papers[:args.stop_after] if args.stop_after is not None else papers
@@ -153,15 +179,19 @@ def main():
             execution='逐篇独立子进程，已完成项跳过；失败项仅在显式retry-failed时从头重试',
             examples=[dict(paper_id=p['paper_id'],title=p['title']) for p in scheduled[:3]]),ensure_ascii=False,indent=2))
         return
-    env=dotenv_values(ROOT/'extraction/.env')
-    model=args.model or os.getenv('DEEPSEEK_MODEL') or env.get('DEEPSEEK_MODEL') or 'deepseek-chat'
-    endpoint=os.getenv('DEEPSEEK_BASE_URL') or env.get('DEEPSEEK_BASE_URL') or 'https://api.deepseek.com'
-    sources=[HERE/'run.py',HERE/'batch.py',HERE/'manifest.json',ROOT/'extraction/prompts_zh.py']+sorted((HERE/'frozen').glob('*.py'))
-    config=dict(input_root=str(root),model=model,validator_model=args.validator_model or model,
+    backend=configure_backend(args)
+    model=backend.model
+    endpoint=backend.base_url
+    sources=[ROOT/'extraction/llm_backend.py',ROOT/'extraction/extract_md_deepseek.py',ROOT/'extraction/entity_names.py',ROOT/'extraction/extraction_policy.py',ROOT/'extraction/batch_extract.py',HERE/'run.py',HERE/'batch.py',HERE/'manifest.json',ROOT/'extraction/prompts_zh.py',ROOT/'extraction/evaluation_agent.py',ROOT/'extraction/evaluation_rubric.py']+sorted((HERE/'frozen').glob('*.py'))
+    config=dict(backend=backend.name,input_root=str(root),model=model,validator_model=args.validator_model or model,
         evaluator_model=args.evaluator_model or model,endpoint_sha256=digest(endpoint.encode()),
         threshold=args.threshold,max_tokens=args.max_tokens,thinking=args.thinking,
         local_formula_completion=not args.no_local_formula_completion,
         source_sha256={str(p.relative_to(ROOT)):digest(p.read_bytes()) for p in sources})
+    config['entity_constrained_relations']=True
+    config['extraction_requests']=2
+    config['extraction_protocol']='unified_legacy_paragraph'
+    config['validator_input']='all_extracted' if args.ungated_validator else 'ontology_conformed AND evidence_validated'
     manifest=dict(config=config,papers=papers,missing_full_md=missing,duplicate_document_groups=duplicate_groups,
                   run_date=datetime.now(ZoneInfo('Asia/Shanghai')).date().isoformat())
     if out.exists() and not (out/'manifest.json').exists():parser.error('输出目录已存在但不是本批量入口目录，请换新目录')
@@ -213,10 +243,13 @@ def main():
             directory.mkdir(parents=True,exist_ok=True)
             attempt=directory/f'attempt_{len(attempts)+1:03d}'
             command=[sys.executable,str(HERE/'run.py'),'--markdown',paper['document_path'],'--output',str(attempt),
+                '--backend',backend.name,'--base-url',endpoint,
                 '--paper-id',paper['paper_id'],'--date',manifest['run_date'],'--model',model,
                 '--validator-model',config['validator_model'],'--evaluator-model',config['evaluator_model'],
                 '--threshold',str(args.threshold),'--max-tokens',str(args.max_tokens),'--thinking',args.thinking]
             if args.no_local_formula_completion:command.append('--no-local-formula-completion')
+            if args.entity_constrained_relations:command.append('--entity-constrained-relations')
+            if args.ungated_validator:command.append('--ungated-validator')
             log=directory/f'{attempt.name}.log'
             print(f"[{i}/{len(scheduled)}] 开始：{paper['title']}；日志：{log}",flush=True)
             # 先登记尝试，意外中断也不会在下次启动时无提示地重复付费。
